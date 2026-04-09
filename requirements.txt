@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn==0.30.0
+SQLAlchemy==2.0.34
+asyncpg==0.29.0
+pydantic==2.8.2
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+# requirements-dev.txt
+pre-commit==4.4.0

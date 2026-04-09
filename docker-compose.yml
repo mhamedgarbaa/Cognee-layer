@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    container_name: workspace_db
+    environment:
+      POSTGRES_USER: workspace_user
+      POSTGRES_PASSWORD: workspace_pass
+      POSTGRES_DB: workspace_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workspace_user -d workspace_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    container_name: workspace_api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_URI: "postgresql+asyncpg://workspace_user:workspace_pass@db:5432/workspace_db"
+      APP_ENV: "development"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    command: [
+      "uvicorn",
+      "app:app",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--reload"
+    ]
+
+volumes:
+  pgdata:

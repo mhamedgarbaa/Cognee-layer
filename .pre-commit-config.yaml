@@ -1,0 +1,43 @@
+# .pre-commit-config.yaml
+repos:
+  # isort MUST run before black and MUST use black profile
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile=black"]
+
+  # Black for code formatting
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+
+  # Flake8 for linting
+  - repo: https://github.com/pycqa/flake8
+    rev: 6.1.0
+    hooks:
+      - id: flake8
+        additional_dependencies:
+          - flake8-bugbear
+          - flake8-import-order
+        args:
+          - "--max-line-length=120"
+          - "--ignore=B008,I100,I201"
+
+  # Mypy for type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.5.1
+    hooks:
+      - id: mypy
+        args:
+          - "--ignore-missing-imports"
+          - "--disable-error-code=attr-defined"
+
+  # Pre-commit basic checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: trailing-whitespace
+      - id: end-of-file-fixer

@@ -1,0 +1,9 @@
+# Workflows
+/.github/ @Spark-AI-Talan/spark-admins
+
+# Helm charts
+/helm/ @Spark-AI-Talan/spark-admins
+
+# CODEOWNERS files
+CODEOWNERS @Spark-AI-Talan/spark-admins
+
