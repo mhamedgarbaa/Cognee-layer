@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from api.middlewares.logging_middleware import LoggingMiddleware, RequestIDMiddleware
 from api.routers.v1.workspace_router import router as workspaces_v1_router
+from api.routers.v1.memory_router import router as memory_router
 from configuration.database import init_db
 from configuration.logging_setup import logger
 from configuration.settings import settings
@@ -38,6 +39,10 @@ def create_app() -> FastAPI:
     # Routers
     app.include_router(
         workspaces_v1_router,
+        prefix=f"{settings.API_PREFIX}/v1",
+    )
+    app.include_router(
+        memory_router,
         prefix=f"{settings.API_PREFIX}/v1",
     )
 

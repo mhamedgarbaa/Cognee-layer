@@ -18,16 +18,46 @@ services:
       timeout: 5s
       retries: 5
 
+  cognee-mcp:
+    image: cognee/cognee-mcp:main
+    container_name: cognee_mcp_server
+    environment:
+      - TRANSPORT_MODE=http
+      - LLM_PROVIDER=ollama
+      - LLM_MODEL=mistral
+      - LLM_ENDPOINT=http://host.docker.internal:11434
+      - LLM_API_KEY=ollama  # Dummy key for Ollama (not authenticated)
+      - EMBEDDING_PROVIDER=ollama
+      - EMBEDDING_MODEL=nomic-embed-text
+      - EMBEDDING_ENDPOINT=http://host.docker.internal:11434
+      - EMBEDDING_DIMENSIONS=768  # nomic-embed-text dimension
+      - HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1
+      - DB_PROVIDER=sqlite
+      - VECTOR_DB_PROVIDER=lancedb
+      - GRAPH_DATABASE_PROVIDER=kuzu
+    volumes:
+      - cognee_data:/root/.cognee_system
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   web:
     build: .
     container_name: workspace_api
     depends_on:
       db:
         condition: service_healthy
+      cognee-mcp:
+        condition: service_healthy
     environment:
       POSTGRES_URI: "postgresql+asyncpg://workspace_user:workspace_pass@db:5432/workspace_db"
       APP_ENV: "development"
       LOG_LEVEL: "INFO"
+      COGNEE_MCP_ENDPOINT: "http://cognee-mcp:8000/mcp"
     ports:
       - "8000:8000"
     volumes:
@@ -42,3 +72,4 @@ services:
 
 volumes:
   pgdata:
+  cognee_data:

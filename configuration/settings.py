@@ -94,5 +94,28 @@ class DatabaseSettings(BaseSettings):
         )
 
 
+# -------------------------------
+# COGNEE MEMORY SUBSYSTEM CONFIG
+# -------------------------------
+class CogneeSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    COGNEE_MCP_ENDPOINT: str = Field(
+        env="COGNEE_MCP_ENDPOINT",
+        default="http://localhost:8000/mcp",
+        description="HTTP transport endpoint for Cognee MCP server"
+    )
+    COGNEE_TIMEOUT_SECONDS: int = Field(
+        env="COGNEE_TIMEOUT_SECONDS",
+        default=10,
+        description="Circuit breaker timeout for LLM graph generation"
+    )
+
+
 settings = AppConfig()
 db_settings = DatabaseSettings()
+cognee_settings = CogneeSettings()
