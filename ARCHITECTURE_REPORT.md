@@ -509,9 +509,98 @@ trace_id: abc123def456
 
 ---
 
-## 8. Data Model & Schemas
+## 8. Technical Implementation Specifications
 
-### 8.1 API Schemas
+To meet enterprise production standards, this architecture implements the following low-level engineering controls:
+
+### 8.1 Clients & Tooling
+
+**MCP Client Integration:** Full support for temporal memory ingestion, `cognify` pipeline triggers, and graph `search`.
+- HTTP/SSE transport with automatic session management
+- JSON-RPC 2.0 protocol compliance
+- Streaming response handling for long-running operations
+
+**Cognee Backend Client:** Direct support for `memify`, `add` operations, and strict tenant permission boundaries.
+- Built-in support for multi-user access control (ENABLE_BACKEND_ACCESS_CONTROL)
+- Per-user data isolation at database level
+- Temporal constraint enforcement
+
+**Tool Registry:** 8 integrated Cognee tools exposed to the agent for granular memory management.
+- `save_interaction()` - Write to STM
+- `trigger_cognify()` - Promote STM → LTM
+- `search()` - Query with fallback
+- `get_graph_completion()` - Synthesize temporal context
+- `get_chunks()` - Raw semantic search
+- Health check endpoints - Monitor subsystem status
+
+**Context Propagation:** Ensures tenant IDs and request traces flow seamlessly from the Connector Gateway down to the embedded databases.
+- `user_id` immutably threaded through all async operations
+- Trace ID propagation via OpenTelemetry baggage
+- Request context stored in FastAPI's request scope
+
+### 8.2 Resilience Layer
+
+**Retry Policies:** Network calls to the memory subsystem utilize 3-attempt retries with exponential backoff.
+```python
+# Retry configuration
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 1.5  # 1.5s, 2.25s, 3.375s delays
+```
+- Applied to all MCP HTTP calls
+- Skips retry on timeout (fail-fast for LLM bottleneck)
+
+**Circuit Breakers:** Per-service circuit breakers prevent cascading failures if local LLMs (Ollama) or embedded graphs (Kuzu) hang.
+- Open state: Trip after 5 consecutive failures
+- Half-open state: Allow 1 trial request after 30s cooldown
+- Closed state: Normal operation, track failure count
+- Fallback to CHUNKS path when circuit trips
+
+**Response Caching:** Standardized graph queries utilize a 1-hour TTL cache to reduce redundant LLM synthesis load.
+- In-process LRU cache (default: 1000 entries)
+- Cache key: `(user_id, query_hash, query_type)`
+- Invalidation on STM writes to same user
+- Metrics: Cache hit rate (target: >30% for common queries)
+
+**Graceful Degradation:** Automatic fallback to Short-Term Memory/Raw logs if the Long-Term Memory graph fails.
+- Level 1 (Primary): GRAPH_COMPLETION with full LLM synthesis
+- Level 2 (Fallback): CHUNKS with direct semantic search (50x faster)
+- Level 3 (Final): Empty context, agent uses conversation history
+
+### 8.3 Observability
+
+**OpenTelemetry:** Full OTEL tracing enabled for distributed request tracking.
+- W3C Trace Context propagation
+- 1% sampling by default (configurable)
+- Exporters: OTLP/gRPC (to Jaeger/DataDog/Honeycomb)
+
+**Automatic Instrumentation:** HTTP and database calls are auto-instrumented without polluting business logic.
+- FastAPI middleware captures all `/api/v1/memory/*` requests
+- HTTP client (httpx) automatically spans all MCP calls
+- Span attributes: method, path, status_code, user_id, is_degraded
+
+**Metrics & Health:** Prometheus-compatible metrics exported alongside dedicated health check endpoints for container orchestration readiness probes.
+- Metrics endpoint: `GET /metrics` (Prometheus format)
+- Health check: `GET /health` (returns 200 OK + system status)
+- Readiness check: `GET /ready` (checks MCP connectivity)
+- Liveness check: `GET /live` (checks process health)
+
+**Example Prometheus Queries:**
+```
+# Request latency (p95)
+histogram_quantile(0.95, memory_recall_latency_ms)
+
+# Fallback rate (should be <5%)
+rate(memory_fallback_count[5m]) / rate(memory_recall_count[5m])
+
+# Circuit breaker state (0=closed, 1=open)
+memory_circuit_breaker_state{service="cognee_mcp"}
+```
+
+---
+
+## 9. Data Model & Schemas
+
+### 9.1 API Schemas
 
 **RecordMemoryRequest:**
 ```python
@@ -535,7 +624,7 @@ class ContextResponseSchema(BaseModel):
     retrieval_method: str  # "GRAPH_COMPLETION", "CHUNKS_FALLBACK", "NONE_FAILED"
 ```
 
-### 8.2 Domain Models
+### 9.2 Domain Models
 
 **ContextEnvelope (Service Layer):**
 ```python
@@ -548,9 +637,9 @@ class ContextEnvelope(BaseModel):
 
 ---
 
-## 9. Deployment & Infrastructure
+## 10. Deployment & Infrastructure
 
-### 9.1 Docker Compose Stack
+### 10.1 Docker Compose Stack
 
 ```yaml
 version: '3.9'
@@ -599,7 +688,7 @@ services:
       - "8000:8000"
 ```
 
-### 9.2 Component Summary
+### 10.2 Component Summary
 
 | Component | Technology | Role | Data |
 |-----------|-----------|------|------|
@@ -612,9 +701,9 @@ services:
 
 ---
 
-## 10. Performance & SLA
+## 11. Performance & SLA
 
-### 10.1 Latency Targets
+### 11.1 Latency Targets
 
 | Operation | Target | Typical | P99 |
 |-----------|--------|---------|-----|
@@ -623,7 +712,7 @@ services:
 | Recall (Fallback 1) | <150ms | 75ms | 120ms |
 | Recall (Fallback 2) | <50ms | 10ms | 40ms |
 
-### 10.2 Throughput
+### 11.2 Throughput
 
 - **Write throughput**: 1,000+ interactions/second (SQLite, local)
 - **Read throughput**: 100+ concurrent queries (limited by LLM availability)
@@ -637,16 +726,16 @@ services:
 
 ---
 
-## 11. Security & Isolation
+## 12. Security & Isolation
 
-### 11.1 Multi-Tenant Isolation
+### 12.1 Multi-Tenant Isolation
 
 ✅ **User ID Immutability**: `user_id` threaded through all layers, cannot be modified
 ✅ **Query Isolation**: Cognee enforces per-user data boundaries
 ✅ **STM Partitioning**: Rows tagged with user_id, indexed for fast filtering
 ✅ **Graph Isolation**: Temporal nodes scoped to user context
 
-### 11.2 Access Control
+### 12.2 Access Control
 
 ✅ **No Direct DB Access**: All queries go through Cognee MCP API
 ✅ **Timeout Protection**: Configurable request timeouts prevent resource exhaustion
@@ -654,7 +743,7 @@ services:
 
 ---
 
-## 12. Future Enhancements
+## 13. Future Enhancements
 
 ### Potential Additions (Out of Scope for v1.0)
 
@@ -668,7 +757,7 @@ services:
 
 ---
 
-## 13. Conclusion
+## 14. Conclusion
 
 The Cognee Temporal Memory Subsystem achieves the objectives of:
 
