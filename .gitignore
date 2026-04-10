@@ -13,7 +13,9 @@ build/
 # Virtual environment
 venv/
 .env
-
+COGNEE_MCP_INTEGRATION_GUIDE.md
+STARTUP_GUIDE.md
+DOCKER_CONFIG_FIX.md
 # IDEs
 .vscode/
 .idea/
