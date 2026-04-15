@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import Any, Dict, List
 
 
 class RecordMemoryRequest(BaseModel):
@@ -16,3 +16,28 @@ class ContextResponseSchema(BaseModel):
     context_data: List[str]
     is_degraded: bool
     retrieval_method: str
+
+
+class DeleteMemoryRequest(BaseModel):
+    data_id: str = Field(..., description="UUID of the data item to delete")
+    dataset_id: str = Field(..., description="UUID of the dataset containing the data")
+    mode: str = Field("soft", description="Deletion mode: 'soft' or 'hard'")
+
+
+class DataInventoryResponse(BaseModel):
+    datasets: List[Any] = Field(default_factory=list, description="List of datasets and data items")
+
+
+class DeleteMemoryResponse(BaseModel):
+    status: str
+    details: Dict[str, Any] = {}
+
+
+class PruneMemoryResponse(BaseModel):
+    status: str
+    message: str
+
+
+class CognifyStatusResponse(BaseModel):
+    status: str
+    details: Dict[str, Any] = {}

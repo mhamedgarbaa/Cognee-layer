@@ -57,3 +57,30 @@ class CogneeRepository:
             "query_type": query_type
         })
         return result.get("data", [])
+
+    async def list_data(self, dataset_id: str | None = None) -> list:
+        """List all datasets and data items, optionally filtered by dataset_id."""
+        arguments: Dict[str, Any] = {}
+        if dataset_id is not None:
+            arguments["dataset_id"] = dataset_id
+        result = await self._call_mcp_tool("list_data", arguments)
+        return result.get("data", []) if isinstance(result, dict) else []
+
+    async def delete_data(self, data_id: str, dataset_id: str, mode: str = "soft") -> Dict[str, Any]:
+        """Delete a specific data item from a dataset."""
+        result = await self._call_mcp_tool("delete", {
+            "data_id": data_id,
+            "dataset_id": dataset_id,
+            "mode": mode,
+        })
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def prune(self) -> Dict[str, Any]:
+        """Permanently delete ALL data from the Cognee knowledge graph."""
+        result = await self._call_mcp_tool("prune", {})
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def cognify_status(self) -> Dict[str, Any]:
+        """Check the status of the cognify pipeline."""
+        result = await self._call_mcp_tool("cognify_status", {})
+        return result if isinstance(result, dict) else {"raw": result}
