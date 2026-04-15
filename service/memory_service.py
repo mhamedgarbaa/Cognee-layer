@@ -9,20 +9,43 @@ from service.business_models import (
     CognifyStatus,
 )
 from configuration.logging_setup import logger
+import asyncio
+import re
 
 
 class MemoryService:
     def __init__(self, repo: CogneeRepository):
         self.repo = repo
 
+    @staticmethod
+    def _is_non_critical_save_interaction_error(error_message: str) -> bool:
+        """Detect known Cognee rule-generation schema issues after interaction save."""
+        patterns = [
+            r"validation error for RuleSet",
+            r"Field required \[type=missing",
+            r"Input should be a valid integer",
+            r"InstructorRetryException",
+            r"Failed to Save interaction: <failed_attempts>",
+        ]
+        return any(re.search(pattern, error_message, re.IGNORECASE) for pattern in patterns)
+
     async def record_agent_memory(self, user_id: str, fact: str) -> None:
         """Stores a fact and triggers background temporal consolidation."""
         try:
             # 1. Fast Append to STM (SQLite)
-            await self.repo.save_interaction(user_id=user_id, data=fact)
+            try:
+                await self.repo.save_interaction(user_id=user_id, data=fact)
+            except CogneeToolError as e:
+                if self._is_non_critical_save_interaction_error(str(e)):
+                    logger.warning(
+                        "Ignoring non-critical Cognee RuleSet validation error after save_interaction",
+                        extra={"user_id": user_id, "error": str(e)},
+                    )
+                else:
+                    raise
 
             # 2. Trigger LTM Consolidation (Neo4j/Kuzu Temporal Graph)
-            await self.repo.trigger_cognify(user_id=user_id)
+            await self.repo.trigger_cognify(user_id=user_id, data=fact)
 
             logger.info("Memory recorded and consolidation triggered", extra={"user_id": user_id})
         except CogneeConnectionError as e:
@@ -36,10 +59,13 @@ class MemoryService:
         """Retrieves context with Graceful Degradation (Circuit Breaker)."""
         try:
             # Attempt Primary: Synthesized Temporal Graph Retrieval (Uses LLM)
-            results = await self.repo.search(
-                user_id=user_id,
-                query=query,
-                query_type="GRAPH_COMPLETION"
+            results = await asyncio.wait_for(
+                self.repo.search(
+                    user_id=user_id,
+                    query=query,
+                    query_type="GRAPH_COMPLETION"
+                ),
+                timeout=60,
             )
             return ContextEnvelope(
                 context_data=[str(r) for r in results],
@@ -47,15 +73,26 @@ class MemoryService:
                 retrieval_method="GRAPH_COMPLETION"
             )
 
+        except asyncio.TimeoutError:
+            logger.warning("GRAPH_COMPLETION timed out", extra={"user_id": user_id})
+            return ContextEnvelope(
+                context_data=[],
+                is_degraded=True,
+                retrieval_method="GRAPH_TIMEOUT"
+            )
+
         except (CogneeConnectionError, CogneeToolError) as e:
             logger.warning(f"GRAPH_COMPLETION failed, falling back to CHUNKS. Error: {e}", extra={"user_id": user_id})
 
             try:
                 # Attempt Fallback: Raw Semantic Search (Bypasses LLM bottleneck)
-                fallback_results = await self.repo.search(
-                    user_id=user_id,
-                    query=query,
-                    query_type="CHUNKS"
+                fallback_results = await asyncio.wait_for(
+                    self.repo.search(
+                        user_id=user_id,
+                        query=query,
+                        query_type="CHUNKS"
+                    ),
+                    timeout=20,
                 )
                 return ContextEnvelope(
                     context_data=[str(r) for r in fallback_results],
@@ -70,6 +107,10 @@ class MemoryService:
                     is_degraded=True,
                     retrieval_method="NONE_FAILED"
                 )
+
+    # ──────────────────────────────────────────────
+    # Management & Admin Operations
+    # ──────────────────────────────────────────────
 
     async def get_data_inventory(self, dataset_id: str | None = None) -> DataInventory:
         """List all datasets and data items from the Cognee knowledge graph."""

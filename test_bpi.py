@@ -7,10 +7,10 @@ logging.basicConfig(level=logging.INFO)
 
 async def test_bpi():
     try:
-        with open('bpi_france_events.json', 'r', encoding='utf-8') as f:
+        with open('agents/bpi_france_events.json', 'r', encoding='utf-8') as f:
             events = json.load(f)
     except FileNotFoundError:
-        print("bpi_france_events.json not found")
+        print("agents/bpi_france_events.json not found")
         return
         
     tenant_id = "bpi_tester"
