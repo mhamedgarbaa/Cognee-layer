@@ -37,9 +37,9 @@ async def get_workspace_service(
 
 
 # --- Cognee Memory Subsystem Dependencies ---
-# Singleton HTTP client for MCP communication
+# HTTP client for MCP communication
 async def get_http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
-    async with httpx.AsyncClient(timeout=cognee_settings.COGNEE_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=cognee_settings.MCP_TIMEOUT) as client:
         yield client
 
 
@@ -49,7 +49,8 @@ async def get_cognee_repository(
     """Provides the Cognee MCP repository."""
     return CogneeRepository(
         http_client=client,
-        mcp_endpoint=cognee_settings.COGNEE_MCP_ENDPOINT
+        mcp_endpoint=cognee_settings.COGNEE_MCP_ENDPOINT,
+        mcp_host_header=cognee_settings.MCP_HOST_HEADER,
     )
 
 

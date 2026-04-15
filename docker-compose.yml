@@ -1,9 +1,13 @@
 version: "3.9"
 
 services:
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
   db:
     image: postgres:15
     container_name: workspace_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: workspace_user
       POSTGRES_PASSWORD: workspace_pass
@@ -12,54 +16,95 @@ services:
       - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    networks:
+      - cognee_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U workspace_user -d workspace_db"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # ============================================
+  # Cognee MCP - Memory Control Protocol server
+  # ============================================
   cognee-mcp:
     image: cognee/cognee-mcp:main
     container_name: cognee_mcp_server
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    networks:
+      - cognee_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
+      # Transport and networking
       - TRANSPORT_MODE=http
-      - LLM_PROVIDER=ollama
-      - LLM_MODEL=mistral
-      - LLM_ENDPOINT=http://host.docker.internal:11434
-      - LLM_API_KEY=ollama  # Dummy key for Ollama (not authenticated)
-      - EMBEDDING_PROVIDER=ollama
-      - EMBEDDING_MODEL=nomic-embed-text
-      - EMBEDDING_ENDPOINT=http://host.docker.internal:11434
-      - EMBEDDING_DIMENSIONS=768  # nomic-embed-text dimension
-      - HUGGINGFACE_TOKENIZER=nomic-ai/nomic-embed-text-v1
+      - ALLOWED_HOSTS=localhost,cognee-mcp,127.0.0.1,*.docker.internal,*
+
+      # LLM Configuration
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_MODEL=${LLM_MODEL:-mistral}
+      # Using host.docker.internal to proxy from container to your local Ollama
+      - LLM_ENDPOINT=http://host.docker.internal:11434/v1
+      - LLM_API_KEY=${LLM_API_KEY:-ollama}
+      - LLM_FORMAT=${LLM_FORMAT:-json}
+
+      # Embedding Configuration
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embed
+      - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
+      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-nomic-ai/nomic-embed-text-v1}
+
+      # Database Configuration
       - DB_PROVIDER=sqlite
       - VECTOR_DB_PROVIDER=lancedb
       - GRAPH_DATABASE_PROVIDER=kuzu
+
+      # Logging
+      - MCP_LOG_LEVEL=INFO
     volumes:
       - cognee_data:/root/.cognee_system
-    ports:
-      - "8001:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 60s
 
+  # ============================================
+  # FastAPI Agent Service
+  # ============================================
   web:
     build: .
     container_name: workspace_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    networks:
+      - cognee_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
       cognee-mcp:
-        condition: service_healthy
+        condition: service_started
     environment:
+      # Database
       POSTGRES_URI: "postgresql+asyncpg://workspace_user:workspace_pass@db:5432/workspace_db"
+      DB_HOST: "db"
+
+      # Cognee MCP configuration (Docker-internal service DNS)
+      MCP_SERVER_URL: "http://cognee-mcp:8000"
+      MCP_PROTOCOL: "http"
+      MCP_HOST_HEADER: "localhost:8001"
+      MCP_TIMEOUT: "300"
+
+      # App settings
       APP_ENV: "development"
       LOG_LEVEL: "INFO"
-      COGNEE_MCP_ENDPOINT: "http://cognee-mcp:8000/mcp"
-    ports:
-      - "8000:8000"
     volumes:
       - ./:/app
     command: [
@@ -69,7 +114,19 @@ services:
       "--port", "8000",
       "--reload"
     ]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:
+    driver: local
   cognee_data:
+    driver: local
+
+networks:
+  cognee_net:
+    driver: bridge

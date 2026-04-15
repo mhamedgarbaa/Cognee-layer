@@ -3,71 +3,100 @@
 ## High-Level Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    EXTERNAL CLIENTS                          │
-│  (AI Agents, FastAPI Users, Cognee Fetcher/Connector)       │
-└────┬──────────────────────────────────────────────────────┬──┘
-     │                                                      │
-     │ REQUEST                                             │ RESPONSE
-     │ (JSON)                                              │ (JSON)
-     │                                                      │
-┌────▼──────────────────────────────────────────────────────▼──┐
-│                    API LAYER                                  │
-│  POST /api/v1/memory/record          RecordMemoryRequest    │
-│  POST /api/v1/memory/recall          RecallMemoryRequest    │
-│  GET  /health                        Health Status          │
-└────┬──────────────────────────────────────────────────────┬──┘
-     │                                                      │
-     │ Service calls                                       │ Response modeling
-     │ (MemoryService)                                     │ (Pydantic schema)
-     │                                                      │
-┌────▼──────────────────────────────────────────────────────▼──┐
-│                   SERVICE LAYER                              │
-│  MemoryService                                              │
-│  ├─ record_agent_memory()                                  │
-│  └─ recall_context() [Circuit Breaker Logic]              │
-└────┬──────────────────────────────────────────────────────┬──┘
-     │                                                      │
-     │ HTTP calls                                          │ Context envelope
-     │ (httpx.AsyncClient)                                 │ (ContextEnvelope)
-     │                                                      │
-┌────▼──────────────────────────────────────────────────────▼──┐
-│                   DATA LAYER                                 │
-│  CogneeRepository                                           │
-│  ├─ save_interaction()                                     │
-│  ├─ trigger_cognify()                                      │
-│  └─ search()                                               │
-└────┬──────────────────────────────────────────────────────┬──┘
-     │                                                      │
-     │ JSON-RPC HTTP POST                                  │ JSON-RPC Response
-     │ (tools/call protocol)                               │ (result/error)
-     │                                                      │
-┌────▼──────────────────────────────────────────────────────▼──┐
-│              COGNEE MCP (Docker Container)                   │
-│  HTTP Streamable Transport (:8001)                          │
-│  ├─ save_interaction() tool                                │
-│  ├─ cognify() tool                                         │
-│  └─ search() tool                                          │
-└────┬──────────────────────────────────────────────────────┬──┘
-     │                                                      │
-     │ Internals                                           │ Results
-     │ (async operations)                                  │ (structured data)
-     │                                                      │
-┌────▼──────────────────────────────────────────────────────▼──┐
-│                COGNEE CORE ENGINE                            │
-│                                                              │
-│  ┌─────────────────┐      ┌─────────────────┐              │
-│  │ STM (SQLite)    │      │ LTM (Kuzu)      │              │
-│  │ Raw text logs   │      │ Knowledge graph │              │
-│  │ + Timestamps    │      │ + Temporal info │              │
-│  └─────────────────┘      └─────────────────┘              │
-│                                                              │
-│  ┌─────────────────┐      ┌─────────────────┐              │
-│  │ LanceDB         │      │ Ollama/Mistral  │              │
-│  │ Embeddings      │      │ LLM synthesis   │              │
-│  │ 768D vectors    │      │ Entity extract  │              │
-│  └─────────────────┘      └─────────────────┘              │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    EXTERNAL CLIENTS                              │
+│  (AI Agents, FastAPI Users, Cognee Fetcher/Connector)            │
+└────┬────────────────────────────────────────────────────────┬────┘
+     │                                                        │
+     │ REQUEST                                                │ RESPONSE
+     │ (JSON)                                                 │ (JSON)
+     │                                                        │
+┌────▼────────────────────────────────────────────────────────▼────┐
+│                    API LAYER (6 endpoints)                        │
+│                                                                  │
+│  ── Core ──────────────────────────────────────────────────────── │
+│  POST   /api/v1/memory/record          RecordMemoryRequest       │
+│  POST   /api/v1/memory/recall          RecallMemoryRequest       │
+│                                                                  │
+│  ── Management ───────────────────────────────────────────────── │
+│  GET    /api/v1/memory/data            DataInventoryResponse     │
+│  DELETE /api/v1/memory/data            DeleteMemoryRequest       │
+│  DELETE /api/v1/memory/prune           PruneMemoryResponse       │
+│                                                                  │
+│  ── Monitoring ───────────────────────────────────────────────── │
+│  GET    /api/v1/memory/cognify/status  CognifyStatusResponse     │
+│                                                                  │
+│  GET    /health                        Health Status             │
+└────┬────────────────────────────────────────────────────────┬────┘
+     │                                                        │
+     │ Service calls                                          │ Response modeling
+     │ (MemoryService)                                        │ (Pydantic schema)
+     │                                                        │
+┌────▼────────────────────────────────────────────────────────▼────┐
+│                   SERVICE LAYER                                  │
+│  MemoryService                                                   │
+│  ├─ record_agent_memory()          → save + cognify              │
+│  ├─ recall_context()               → search [Circuit Breaker]    │
+│  ├─ get_data_inventory()           → list_data                   │
+│  ├─ delete_memory_data()           → delete                      │
+│  ├─ prune_all_memory()             → prune                       │
+│  └─ get_cognify_status()           → cognify_status              │
+└────┬────────────────────────────────────────────────────────┬────┘
+     │                                                        │
+     │ HTTP calls                                             │ Domain models
+     │ (httpx.AsyncClient)                                    │ (business_models)
+     │                                                        │
+┌────▼────────────────────────────────────────────────────────▼────┐
+│                   DATA LAYER                                     │
+│  CogneeRepository                                                │
+│  ├─ save_interaction()    → MCP tool: save_interaction           │
+│  ├─ trigger_cognify()     → MCP tool: cognify                    │
+│  ├─ search()              → MCP tool: search                     │
+│  ├─ list_data()           → MCP tool: list_data                  │
+│  ├─ delete_data()         → MCP tool: delete                     │
+│  ├─ prune()               → MCP tool: prune                      │
+│  └─ cognify_status()      → MCP tool: cognify_status             │
+└────┬────────────────────────────────────────────────────────┬────┘
+     │                                                        │
+     │ JSON-RPC HTTP POST                                     │ JSON-RPC Response
+     │ (tools/call protocol)                                  │ (result/error)
+     │                                                        │
+┌────▼────────────────────────────────────────────────────────▼────┐
+│              COGNEE MCP (Docker Container)                       │
+│  HTTP Streamable Transport (:8001)                               │
+│                                                                  │
+│  ── Core Operations ──────────────────────────────────────────── │
+│  ├─ save_interaction()   Ingestion Engine (STM fast append)      │
+│  ├─ cognify()            Cognify Pipeline (graph construction)   │
+│  ├─ search()             Query Engine  (7 search types)          │
+│                                                                  │
+│  ── Data Management ──────────────────────────────────────────── │
+│  ├─ list_data()          Data Manager  (inventory of datasets)   │
+│  ├─ delete()             Data Manager  (soft/hard delete)        │
+│  ├─ prune()              Data Manager  (full reset)              │
+│                                                                  │
+│  ── Monitoring ───────────────────────────────────────────────── │
+│  └─ cognify_status()     Pipeline Monitor (job progress)         │
+└────┬────────────────────────────────────────────────────────┬────┘
+     │                                                        │
+     │ Internals                                              │ Results
+     │ (async operations)                                     │ (structured data)
+     │                                                        │
+┌────▼────────────────────────────────────────────────────────▼────┐
+│                COGNEE CORE ENGINE                                │
+│                                                                  │
+│  ┌─────────────────┐      ┌─────────────────┐                    │
+│  │ STM (SQLite)    │      │ LTM (Kuzu)      │                    │
+│  │ Raw text logs   │      │ Knowledge graph │                    │
+│  │ + Timestamps    │      │ + Temporal info │                    │
+│  └─────────────────┘      └─────────────────┘                    │
+│                                                                  │
+│  ┌─────────────────┐      ┌─────────────────┐                    │
+│  │ LanceDB         │      │ Ollama/qwen2.5  │                    │
+│  │ Embeddings      │      │ LLM synthesis   │                    │
+│  │ 768D vectors    │      │ Entity extract  │                    │
+│  └─────────────────┘      └─────────────────┘                    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -696,16 +725,25 @@ class ContextEnvelope(BaseModel):
 ### 4.3 Data Layer (Cognee Format)
 
 ```python
-# What gets sent to Cognee MCP
+# What gets sent to Cognee MCP — all 7 tools
 {
     "method": "tools/call",
     "params": {
-        "name": "save_interaction" | "cognify" | "search",
+        "name": "save_interaction" | "cognify" | "search"
+               | "list_data" | "delete" | "prune" | "cognify_status",
         "arguments": {
-            "user": "user123",
-            "data": "...",
-            "query_text": "...",
-            "query_type": "GRAPH_COMPLETION" | "CHUNKS" | ...
+            # save_interaction:
+            #   "user": "...", "data": "..."
+            # cognify:
+            #   "data": "..."
+            # search:
+            #   "search_query": "...", "search_type": "GRAPH_COMPLETION"|"CHUNKS"|..., "top_k": 10
+            # list_data:
+            #   "dataset_id": "..." (optional)
+            # delete:
+            #   "data_id": "...", "dataset_id": "...", "mode": "soft"|"hard"
+            # prune / cognify_status:
+            #   {} (no arguments)
         }
     }
 }
@@ -865,16 +903,27 @@ GRACEFUL DEGRADATION: ✓ Still returned results
 
 | Stage | Component | IN | OUT | Type |
 |-------|-----------|---|-----|------|
-| **1** | Client | HTTP POST | RecordMemoryRequest | JSON |
-| **2** | API Router | RecordMemoryRequest | Call MemoryService | Python object |
-| **3** | Service | (user_id, fact) | Call Repository | Python args |
-| **4** | Repository | (user_id, fact) | HTTP POST to MCP | JSON-RPC |
+| **1** | Client | HTTP POST/GET/DELETE | Request Schema | JSON |
+| **2** | API Router | Request Schema | Call MemoryService | Python object |
+| **3** | Service | Service args | Call Repository | Python args |
+| **4** | Repository | Repository args | HTTP POST to MCP | JSON-RPC |
 | **5** | Cognee MCP | JSON-RPC | Internal processing | Binary (DB ops) |
 | **6** | Cognee MCP | Processing complete | HTTP response | JSON |
-| **7** | Repository | JSON response | Return to Service | Python list |
-| **8** | Service | Results list | Return ContextEnvelope | Python object |
-| **9** | API | ContextEnvelope | ContextResponseSchema | Pydantic model |
-| **10** | Client | HTTP 202/200 | Response JSON | JSON |
+| **7** | Repository | JSON response | Return to Service | Python list/dict |
+| **8** | Service | Raw result | Return domain model | Python object |
+| **9** | API | Domain model | Response Schema | Pydantic model |
+| **10** | Client | HTTP 200/202 | Response JSON | JSON |
+
+### Endpoint → Service → Repository → MCP Tool Mapping
+
+| API Endpoint | Service Method | Repository Method | MCP Tool |
+|---|---|---|---|
+| `POST /memory/record` | `record_agent_memory()` | `save_interaction()` + `trigger_cognify()` | `save_interaction` + `cognify` |
+| `POST /memory/recall` | `recall_context()` | `search()` | `search` |
+| `GET /memory/data` | `get_data_inventory()` | `list_data()` | `list_data` |
+| `DELETE /memory/data` | `delete_memory_data()` | `delete_data()` | `delete` |
+| `DELETE /memory/prune` | `prune_all_memory()` | `prune()` | `prune` |
+| `GET /memory/cognify/status` | `get_cognify_status()` | `cognify_status()` | `cognify_status` |
 
 ---
 
@@ -972,7 +1021,142 @@ CLIENT OUTPUT
 
 ---
 
-## 10. Key Insights
+## 10. MANAGEMENT PATH: Data Inventory & Deletion
+
+### 10.1 List Data — `GET /api/v1/memory/data`
+
+```
+Client → GET /api/v1/memory/data?dataset_id=<optional UUID>
+  │
+  ▼ API Router
+list_memory_data(dataset_id)
+  │
+  ▼ Service Layer
+get_data_inventory(dataset_id)
+  │
+  ▼ Data Layer
+repo.list_data(dataset_id)
+  │
+  ▼ HTTP JSON-RPC
+{
+  "method": "tools/call",
+  "params": {
+    "name": "list_data",
+    "arguments": {"dataset_id": "<UUID>"}
+  }
+}
+  │
+  ▼ Response
+{
+  "datasets": [
+    {"dataset_id": "abc-123", "items": [
+      {"data_id": "def-456", "name": "...", "created_at": "..."}
+    ]}
+  ]
+}
+```
+
+### 10.2 Delete Data — `DELETE /api/v1/memory/data`
+
+```
+Client → DELETE /api/v1/memory/data
+  Body: {"data_id": "def-456", "dataset_id": "abc-123", "mode": "soft"}
+  │
+  ▼ API Router
+delete_memory_data(request)
+  │
+  ▼ Service Layer
+delete_memory_data(data_id, dataset_id, mode)
+  │
+  ▼ Data Layer
+repo.delete_data(data_id, dataset_id, mode)
+  │
+  ▼ HTTP JSON-RPC
+{
+  "method": "tools/call",
+  "params": {
+    "name": "delete",
+    "arguments": {
+      "data_id": "def-456",
+      "dataset_id": "abc-123",
+      "mode": "soft"
+    }
+  }
+}
+  │
+  ▼ Response
+{"status": "deleted", "details": {"deleted_nodes": 3}}
+```
+
+**Deletion Modes**:
+- `soft` — Removes the data item but preserves shared entity nodes
+- `hard` — Also removes degree-one entity nodes that become orphaned
+
+---
+
+## 11. ADMIN PATH: Prune (Full Reset)
+
+### `DELETE /api/v1/memory/prune`
+
+```
+Client → DELETE /api/v1/memory/prune
+  │
+  ▼ API Router → Service → Repository
+  │
+  ▼ HTTP JSON-RPC
+{
+  "method": "tools/call",
+  "params": {"name": "prune", "arguments": {}}
+}
+  │
+  ▼ Cognee MCP
+  ├─ prune_data()    → Wipes all datasets, chunks, embeddings
+  └─ prune_system()  → Wipes all graph nodes, edges, metadata
+  │
+  ▼ Response
+{"status": "pruned", "message": "Knowledge graph reset complete."}
+```
+
+⚠️ **This is irreversible.** All STM, LTM, embeddings, and graph data are permanently destroyed.
+
+---
+
+## 12. MONITORING PATH: Cognify Status
+
+### `GET /api/v1/memory/cognify/status`
+
+```
+Client → GET /api/v1/memory/cognify/status
+  │
+  ▼ API Router → Service → Repository
+  │
+  ▼ HTTP JSON-RPC
+{
+  "method": "tools/call",
+  "params": {"name": "cognify_status", "arguments": {}}
+}
+  │
+  ▼ Response
+{
+  "status": "completed",
+  "details": {
+    "active_jobs": 0,
+    "completed_jobs": 5,
+    "last_run": "2026-04-15T10:30:00Z",
+    "pipeline": "cognify_pipeline",
+    "dataset": "main_dataset"
+  }
+}
+```
+
+**Use cases**:
+- After calling `POST /memory/record`, poll this endpoint to know when cognify finishes
+- Monitor background pipeline health
+- Detect stuck or failed cognify jobs
+
+---
+
+## 13. Key Insights
 
 ✅ **Layered data transformations**: Each layer adds structure/meaning
 ✅ **Immutable user_id**: Threaded through entire stack for isolation
@@ -980,4 +1164,7 @@ CLIENT OUTPUT
 ✅ **Circuit breaker on network boundary**: Fallback happens at Data→Service boundary
 ✅ **Status signaling**: `is_degraded` flag tells client whether to trust context
 ✅ **Zero data loss**: Even if Cognee is down, facts saved to STM first
+✅ **Full tool coverage**: All 7 Cognee MCP tools are exposed through the API
+✅ **Data lifecycle management**: list → inspect → delete individual items or prune all
+✅ **Pipeline observability**: cognify_status enables polling-based progress tracking
 

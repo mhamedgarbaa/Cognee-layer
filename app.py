@@ -36,6 +36,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Health check endpoint
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint."""
+        return {"status": "ok"}
+
     # Routers
     app.include_router(
         workspaces_v1_router,

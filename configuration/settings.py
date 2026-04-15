@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Union
+from typing import List, Optional, Union
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -104,16 +104,42 @@ class CogneeSettings(BaseSettings):
         extra="ignore",
     )
 
-    COGNEE_MCP_ENDPOINT: str = Field(
+    MCP_SERVER_URL: str = Field(
+        env="MCP_SERVER_URL",
+        default="http://localhost:8001",
+        description="HTTP endpoint for Cognee MCP server"
+    )
+    MCP_ENDPOINT_OVERRIDE: Optional[str] = Field(
         env="COGNEE_MCP_ENDPOINT",
-        default="http://localhost:8000/mcp",
-        description="HTTP transport endpoint for Cognee MCP server"
+        default=None,
+        description="Full Cognee MCP endpoint URL (backward-compatible override)"
     )
-    COGNEE_TIMEOUT_SECONDS: int = Field(
-        env="COGNEE_TIMEOUT_SECONDS",
-        default=10,
-        description="Circuit breaker timeout for LLM graph generation"
+    MCP_PROTOCOL: str = Field(
+        env="MCP_PROTOCOL",
+        default="http",
+        description="Protocol for MCP communication (http or sse)"
     )
+    MCP_HOST_HEADER: Optional[str] = Field(
+        env="MCP_HOST_HEADER",
+        default="localhost:8001",
+        description="Optional Host header override for MCP strict host validation"
+    )
+    MCP_TIMEOUT: int = Field(
+        env="MCP_TIMEOUT",
+        default=60,
+        description="Timeout for MCP requests in seconds"
+    )
+
+    @property
+    def COGNEE_MCP_ENDPOINT(self) -> str:
+        """Return normalized MCP endpoint, supporting legacy and current env styles."""
+        if self.MCP_ENDPOINT_OVERRIDE:
+            return self.MCP_ENDPOINT_OVERRIDE.rstrip("/")
+
+        base_url = self.MCP_SERVER_URL.rstrip("/")
+        if base_url.endswith("/mcp"):
+            return base_url
+        return f"{base_url}/mcp"
 
 
 settings = AppConfig()
