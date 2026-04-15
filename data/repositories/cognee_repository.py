@@ -7,9 +7,10 @@ from data.custom_data_exceptions import CogneeConnectionError, CogneeToolError
 class CogneeRepository:
     """Repository wrapping the Cognee MCP HTTP Transport API."""
 
-    def __init__(self, http_client: httpx.AsyncClient, mcp_endpoint: str):
+    def __init__(self, http_client: httpx.AsyncClient, mcp_endpoint: str, mcp_host_header: str | None = None):
         self.client = http_client
         self.endpoint = mcp_endpoint
+        self.mcp_host_header = mcp_host_header
 
     async def _call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Helper to format the MCP JSON-RPC/HTTP request."""
