@@ -49,6 +49,10 @@ services:
       - LLM_ENDPOINT=http://host.docker.internal:11434/v1
       - LLM_API_KEY=${LLM_API_KEY:-ollama}
       - LLM_FORMAT=${LLM_FORMAT:-json}
+      # Throttle request bursts to avoid Ollama timeout spikes under load
+      - LLM_RATE_LIMIT_ENABLED=true
+      - LLM_RATE_LIMIT_REQUESTS=2
+      - LLM_RATE_LIMIT_INTERVAL=10
 
       # Embedding Configuration
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
@@ -56,6 +60,9 @@ services:
       - EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embed
       - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
       - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-nomic-ai/nomic-embed-text-v1}
+      - EMBEDDING_RATE_LIMIT_ENABLED=true
+      - EMBEDDING_RATE_LIMIT_REQUESTS=4
+      - EMBEDDING_RATE_LIMIT_INTERVAL=10
 
       # Database Configuration
       - DB_PROVIDER=sqlite

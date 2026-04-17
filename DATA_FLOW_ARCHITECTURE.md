@@ -86,8 +86,8 @@
 │                COGNEE CORE ENGINE                                │
 │                                                                  │
 │  ┌─────────────────┐      ┌─────────────────┐                    │
-│  │ STM (SQLite)    │      │ LTM (Kuzu)      │                    │
-│  │ Raw text logs   │      │ Knowledge graph │                    │
+│  │ STM (SQLite)    │      │ LTM (Kuzu*)     │                    │
+│  │ Raw text logs   │      │ Traversal graph │                    │
 │  │ + Timestamps    │      │ + Temporal info │                    │
 │  └─────────────────┘      └─────────────────┘                    │
 │                                                                  │
@@ -98,6 +98,8 @@
 │  └─────────────────┘      └─────────────────┘                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+*Runtime note*: `LTM (Kuzu*)` means Kuzu is optional in current deployments; when it is empty, graph extraction uses SQLite `graph_relationship_ledger` + LanceDB payload tables.
 
 ---
 
@@ -326,12 +328,14 @@ Step 3: Cognify process begins (async)
   │    }
   │  }
   ├─ Generate embeddings: 768D vectors
-  ├─ Store in Kuzu (graph DB):
+  ├─ Store relationship lineage in SQLite ledger (`graph_relationship_ledger`)
+  ├─ Store payload vectors in LanceDB (vector DB)
+  ├─ Optionally materialize traversal graph in Kuzu (graph DB)
   │  (User)-[PREFERS {valid_from: ..., valid_to: null}]->(dark_mode)
-  └─ Store in LanceDB (vector DB):
+  └─ Store semantic embedding:
      "dark_mode_preference" -> [0.234, -0.512, 0.891, ...]
 
-Output: LTM updated with temporal knowledge graph
+Output: LTM artifacts updated (SQLite ledger + LanceDB always, Kuzu when available)
 ```
 
 ---
@@ -510,10 +514,14 @@ Step 2: Vector DB lookup (LanceDB)
     2. async_programming (similarity: 0.89)
     3. FastAPI (similarity: 0.78)
 
-Step 3: Graph DB traversal (Kuzu)
-  MATCH (u:User)-[p:PREFERS]->(pref:Preference)
-  WHERE u.id = 'user123' AND p.valid_from <= NOW()
-  RETURN construct temporal subgraph
+Step 3: Graph traversal layer
+  Primary (if populated): Kuzu traversal
+    MATCH (u:User)-[p:PREFERS]->(pref:Preference)
+    WHERE u.id = 'user123' AND p.valid_from <= NOW()
+    RETURN construct temporal subgraph
+  Runtime fallback (if Kuzu empty):
+    reconstruct links from SQLite `graph_relationship_ledger`
+    + typed payloads from LanceDB tables
 
 Step 4: LLM Synthesis (Mistral via Ollama)
   Prompt: "Based on this context, answer: What is the user's preference for coding?"
@@ -948,6 +956,10 @@ LLM_MODEL=mistral
 LLM_ENDPOINT=http://host.docker.internal:11434
 GRAPH_DATABASE_PROVIDER=kuzu
 VECTOR_DB_PROVIDER=lancedb
+
+# Runtime note (validated 2026-04-16)
+# Kuzu may be empty while SQLite ledger + LanceDB are populated.
+# Graph extraction/visualization should use LanceDB+SQLite first, then Kuzu.
 ```
 
 ---
@@ -984,8 +996,9 @@ SQLite: INSERT INTO interactions VALUES ('user123', 'prefers dark mode', NOW())
     │
     ▼ Cognify process (background)
     │
-Kuzu Graph: (User)-[PREFERS]->(dark_mode)
-LanceDB: "dark_mode_preference" → [768D embedding]
+  SQLite ledger: source_node_id/destination_node_id edges
+  LanceDB: typed payload nodes + 768D embeddings
+  Kuzu Graph: traversal projection (optional; may be empty)
     │
     ▼ Later: Recall query
     │
@@ -1018,8 +1031,6 @@ ContextEnvelope(
     ▼
 CLIENT OUTPUT
 ```
-
----
 
 ## 10. MANAGEMENT PATH: Data Inventory & Deletion
 
@@ -1167,4 +1178,26 @@ Client → GET /api/v1/memory/cognify/status
 ✅ **Full tool coverage**: All 7 Cognee MCP tools are exposed through the API
 ✅ **Data lifecycle management**: list → inspect → delete individual items or prune all
 ✅ **Pipeline observability**: cognify_status enables polling-based progress tracking
+
+---
+
+## 14. Runtime Findings & Mitigation (2026-04-16)
+
+Observed in the deployed environment:
+
+- `visualize_graph.py` reported `Source: lancedb_sqlite_fallback`
+- Kuzu counts were `0 nodes / 0 edges`
+- SQLite `graph_relationship_ledger` was populated (`total: 151`, `deleted: 0`)
+- LanceDB tables were populated (`Entity_name`, `EntityType_name`, `DocumentChunk_text`, `TextDocument_name`, `TextSummary_text`, `EdgeType_relationship_name`)
+
+Applied mitigation:
+
+1. Graph extraction now prioritizes LanceDB + SQLite ledger.
+2. Kuzu graph engine is used as a secondary fallback only.
+3. Pipeline diagnostics are printed with each graph extraction run (grouped `pipeline_runs`, recent entries, ledger totals, Kuzu counts).
+
+Result:
+
+- Graph visualization and stats remain available even when Kuzu is not materialized.
+- Typed node distributions and relationship types are still recoverable from LanceDB + SQLite.
 

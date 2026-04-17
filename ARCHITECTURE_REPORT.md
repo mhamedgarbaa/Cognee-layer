@@ -1,14 +1,16 @@
 # Architecture Report: Cognee Temporal Memory Subsystem
 
-**Date:** 2026-04-10
-**Status:** Production Ready
-**Version:** 1.0.0
+**Date:** 2026-04-16
+**Status:** Production Ready (with Storage-Aware Graph Fallback)
+**Version:** 1.1.0
 
 ---
 
 ## Executive Summary
 
 The Cognee Memory Subsystem is an isolated, resilient, and observable memory layer designed for AI agents. It implements a two-tier memory lifecycle (Short-Term and Long-Term Memory) to provide immediate responsiveness while supporting deep, temporal graph-based reasoning.
+
+In the current deployment, storage reality is: LanceDB vectors and SQLite relationship ledgers are reliably populated, while Kuzu may be empty for some runs. The architecture now explicitly treats Kuzu traversal as optional and supports a storage-aware fallback path for graph extraction/visualization.
 
 This architecture guarantees multi-tenant data isolation, provides graceful degradation under load, and connects to the broader agentic system via the standard **Model Context Protocol (MCP)**.
 
@@ -184,8 +186,9 @@ LLM Extraction (Mistral/Ollama)
   - Generate embeddings
       ↓
 3. Write to LTM components:
-   - Graph DB (Kuzu): Temporal edges with [valid_from, valid_to]
-   - Vector DB (LanceDB): Entity embeddings + semantic vectors
+  - Relationship ledger (SQLite `graph_relationship_ledger`): durable edge log
+  - Vector DB (LanceDB): entity/document payloads + semantic vectors
+  - Graph DB (Kuzu): temporal traversal store when populated
       ↓
 4. Mark STM records as processed
 ```
@@ -225,7 +228,7 @@ async def record_agent_memory(self, user_id: str, fact: str) -> None:
    - **Temporal Bounds**: Event start/end times
 3. **Embedding**: Generate vector representations for semantic search
 4. **Graph Construction**: Build temporal graph edges with validity windows
-5. **Storage**: Persist to Kuzu (graph) + LanceDB (embeddings)
+5. **Storage**: Persist to LanceDB + SQLite relationship ledger (Kuzu graph when available)
 
 **Example:**
 ```
@@ -313,16 +316,25 @@ Top Matches:
   3. "visual_preference" (similarity: 0.82)
 ```
 
-### 5.4 Graph DB (Knowledge Graph Versions & Temporal Events)
+### 5.4 Graph Layer (Kuzu Optional + SQLite Ledger Fallback)
 
 **Purpose**: Traverse relationships and temporal context
 
-**System**: Kuzu (in-process graph database)
+**Primary Runtime Sources**:
+- SQLite `graph_relationship_ledger` for edge lineage and link structure
+- LanceDB payload tables for typed node materialization
+
+**Optional Traversal Store**:
+- Kuzu (in-process graph database), when populated by `cognify`
 
 **Capabilities:**
 - **Temporal Edges**: Each relationship includes `[valid_from, valid_to]`
 - **Versioning**: Supports temporal validity windows
 - **Traversal**: Multi-hop queries to find related facts
+
+**Operational Note (2026-04-16):**
+- Kuzu node/edge counts can be `0` even while LanceDB tables and SQLite relationship ledgers contain valid graph structure.
+- Visualization and diagnostics should therefore read LanceDB + SQLite first, then use Kuzu when available.
 
 **Example Query:**
 ```cypher
@@ -693,8 +705,9 @@ services:
 | Component | Technology | Role | Data |
 |-----------|-----------|------|------|
 | **STM (Relational)** | SQLite | Raw interaction logs | Text + timestamps |
-| **LTM (Graph)** | Kuzu | Temporal knowledge graph | Entities, relationships, temporal edges |
-| **Embeddings** | LanceDB | Semantic vector index | Entity embeddings (768D) |
+| **Graph Ledger** | SQLite (`graph_relationship_ledger`) | Durable relationship lineage | Source/destination IDs, creator function, labels |
+| **LTM (Graph Traversal)** | Kuzu (optional) | Temporal traversal store | Entities, relationships, temporal edges |
+| **Embeddings + Node Payloads** | LanceDB | Semantic vector index + typed node payloads | 768D vectors, entity/document payloads |
 | **LLM** | Mistral (via Ollama) | Extraction & synthesis | Extracted entities, relationships |
 | **API Server** | FastAPI + uvicorn | HTTP/SSE boundary | JSON-RPC requests/responses |
 | **MCP Transport** | HTTP Streamable | Standardized protocol | JSON payloads |
@@ -766,12 +779,13 @@ The Cognee Temporal Memory Subsystem achieves the objectives of:
 ✅ **Resilience**: Three-level circuit breaker prevents cascading failures
 ✅ **Isolation**: Multi-tenant architecture with immutable user boundaries
 ✅ **Observability**: Comprehensive OTEL instrumentation for production monitoring
+✅ **Storage-Aware Fallback**: Graph workflows remain usable when Kuzu is empty by using LanceDB + SQLite relationship ledger
 
 The system is **production-ready** for integration with AI agent pipelines and can scale to handle thousands of concurrent users with graceful degradation under peak load.
 
 ---
 
-**Document Version**: 1.0.0
-**Last Updated**: 2026-04-10
-**Architecture Status**: ✅ Complete & Deployed
-**Next Review**: 2026-07-10
+**Document Version**: 1.1.0
+**Last Updated**: 2026-04-16
+**Architecture Status**: ✅ Complete, Deployed, and Runtime-Validated
+**Next Review**: 2026-07-16
