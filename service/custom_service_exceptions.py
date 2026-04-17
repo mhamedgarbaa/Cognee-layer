@@ -32,3 +32,10 @@ class ServiceDBError(AppException):
 
     def __init__(self, detail: str = "Database error occurred in service layer"):
         super().__init__(detail)
+
+
+class MemoryServiceUnavailable(AppException):
+    """Raised when the memory subsystem is entirely offline."""
+
+    def __init__(self, detail: str = "Memory service unavailable"):
+        super().__init__(detail)
