@@ -83,23 +83,23 @@
      │ (async operations)                                     │ (structured data)
      │                                                        │
 ┌────▼────────────────────────────────────────────────────────▼────┐
-│                COGNEE CORE ENGINE                                │
+│                COGNEE CORE ENGINE (v2.0 — Plug-and-Play)         │
 │                                                                  │
 │  ┌─────────────────┐      ┌─────────────────┐                    │
-│  │ STM (SQLite)    │      │ LTM (Kuzu*)     │                    │
-│  │ Raw text logs   │      │ Traversal graph │                    │
-│  │ + Timestamps    │      │ + Temporal info │                    │
+│  │ STM (Postgres)  │      │ LTM (Neo4j 5)   │                    │
+│  │ cognee_db       │      │ bolt://neo4j:   │                    │
+│  │ Raw text + ts   │      │   7687 + APOC   │                    │
 │  └─────────────────┘      └─────────────────┘                    │
 │                                                                  │
 │  ┌─────────────────┐      ┌─────────────────┐                    │
-│  │ LanceDB         │      │ Ollama/qwen2.5  │                    │
-│  │ Embeddings      │      │ LLM synthesis   │                    │
-│  │ 768D vectors    │      │ Entity extract  │                    │
+│  │ LanceDB         │      │ Azure OpenAI    │                    │
+│  │ 1536D vectors   │      │ gpt-4o + embed  │                    │
+│  │ (file-backed)   │      │ (HTTPS)         │                    │
 │  └─────────────────┘      └─────────────────┘                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-*Runtime note*: `LTM (Kuzu*)` means Kuzu is optional in current deployments; when it is empty, graph extraction uses SQLite `graph_relationship_ledger` + LanceDB payload tables.
+*Runtime note (v2.0)*: Neo4j is populated synchronously during `cognify`. The prior SQLite + LanceDB fallback for empty Kuzu is no longer needed, though Postgres `graph_relationship_ledger` still provides an audit trail of relationship lineage.
 
 ---
 
@@ -305,7 +305,7 @@ async def trigger_cognify(self, user_id: str) -> None:
 ```
 Input: user_id="user123", data="User prefers dark mode and async programming"
 
-Step 1: Write to STM (SQLite)
+Step 1: Write to STM (Postgres — cognee_db)
   INSERT INTO interactions (user_id, data, timestamp)
   VALUES ('user123', 'User prefers dark mode...', NOW())
 
@@ -327,15 +327,15 @@ Step 3: Cognify process begins (async)
   │      "valid_to": null
   │    }
   │  }
-  ├─ Generate embeddings: 768D vectors
-  ├─ Store relationship lineage in SQLite ledger (`graph_relationship_ledger`)
+  ├─ Generate embeddings: 1536D vectors (Azure OpenAI text-embedding-3-small)
+  ├─ Store relationship lineage in Postgres ledger (`graph_relationship_ledger`)
   ├─ Store payload vectors in LanceDB (vector DB)
-  ├─ Optionally materialize traversal graph in Kuzu (graph DB)
+  ├─ Write traversal graph to Neo4j (bolt://neo4j:7687)
   │  (User)-[PREFERS {valid_from: ..., valid_to: null}]->(dark_mode)
   └─ Store semantic embedding:
-     "dark_mode_preference" -> [0.234, -0.512, 0.891, ...]
+     "dark_mode_preference" -> [0.234, -0.512, 0.891, ...]  # 1536D
 
-Output: LTM artifacts updated (SQLite ledger + LanceDB always, Kuzu when available)
+Output: LTM artifacts updated (Postgres ledger + LanceDB + Neo4j)
 ```
 
 ---
@@ -504,7 +504,7 @@ async def search(self, user_id: str, query: str, query_type: str) -> list:
 ```
 Input: user_id="user123", query="What is the user's preference for coding?"
 
-Step 1: Convert query to embedding (768D)
+Step 1: Convert query to embedding (1536D, Azure OpenAI)
   "user_preference_coding" → [0.156, -0.423, 0.782, ...]
 
 Step 2: Vector DB lookup (LanceDB)
@@ -514,16 +514,13 @@ Step 2: Vector DB lookup (LanceDB)
     2. async_programming (similarity: 0.89)
     3. FastAPI (similarity: 0.78)
 
-Step 3: Graph traversal layer
-  Primary (if populated): Kuzu traversal
+Step 3: Graph traversal (Neo4j via Bolt)
     MATCH (u:User)-[p:PREFERS]->(pref:Preference)
-    WHERE u.id = 'user123' AND p.valid_from <= NOW()
+    WHERE u.id = 'user123' AND p.valid_from <= datetime()
     RETURN construct temporal subgraph
-  Runtime fallback (if Kuzu empty):
-    reconstruct links from SQLite `graph_relationship_ledger`
-    + typed payloads from LanceDB tables
+  Audit trail: Postgres `graph_relationship_ledger` (not queried on hot path)
 
-Step 4: LLM Synthesis (Mistral via Ollama)
+Step 4: LLM Synthesis (Azure OpenAI gpt-4o)
   Prompt: "Based on this context, answer: What is the user's preference for coding?"
   Context: [temporal edges from graph]
 
@@ -951,15 +948,28 @@ DB_HOST=db              # Workspace data (separate from Cognee)
 DB_USER=workspace_user
 DB_NAME=workspace_db
 
-# Inside Cognee MCP container (docker-compose.yml)
-LLM_MODEL=mistral
-LLM_ENDPOINT=http://host.docker.internal:11434
-GRAPH_DATABASE_PROVIDER=kuzu
-VECTOR_DB_PROVIDER=lancedb
+# Inside Cognee MCP container (docker-compose.yml) — v2.0 Plug-and-Play
+LLM_PROVIDER=azure                # was: ollama
+LLM_MODEL=gpt-4o                  # was: mistral
+LLM_ENDPOINT=https://<azure>.services.ai.azure.com/...  # was: http://host.docker.internal:11434
+OPENAI_API_KEY=<azure-key>        # required
 
-# Runtime note (validated 2026-04-16)
-# Kuzu may be empty while SQLite ledger + LanceDB are populated.
-# Graph extraction/visualization should use LanceDB+SQLite first, then Kuzu.
+EMBEDDING_PROVIDER=openai         # was: ollama
+EMBEDDING_MODEL=text-embedding-3-small  # was: nomic-embed-text
+EMBEDDING_DIMENSIONS=1536         # was: 768
+
+DB_PROVIDER=postgres              # was: sqlite
+DB_HOST=db                        # Docker service DNS
+DB_NAME=cognee_db                 # separate from app's workspace_db
+
+GRAPH_DATABASE_PROVIDER=neo4j     # was: kuzu
+GRAPH_DATABASE_URL=bolt://neo4j:7687
+VECTOR_DB_PROVIDER=lancedb        # unchanged
+
+# Security flags (new in v2.0)
+ENABLE_BACKEND_ACCESS_CONTROL=True
+ACCEPT_LOCAL_FILE_PATH=False
+REQUIRE_AUTHENTICATION=False
 ```
 
 ---
@@ -1181,23 +1191,29 @@ Client → GET /api/v1/memory/cognify/status
 
 ---
 
-## 14. Runtime Findings & Mitigation (2026-04-16)
+## 14. Migration Notes — v1.1 → v2.0 (2026-04-17)
 
-Observed in the deployed environment:
+The v1.1 → v2.0 cut replaced all embedded stores with networked backends:
 
-- `visualize_graph.py` reported `Source: lancedb_sqlite_fallback`
-- Kuzu counts were `0 nodes / 0 edges`
-- SQLite `graph_relationship_ledger` was populated (`total: 151`, `deleted: 0`)
-- LanceDB tables were populated (`Entity_name`, `EntityType_name`, `DocumentChunk_text`, `TextDocument_name`, `TextSummary_text`, `EdgeType_relationship_name`)
+| Area | v1.1 | v2.0 |
+|------|------|------|
+| Relational | SQLite (in Cognee container volume) | Postgres 15 (`db` service, `cognee_db` database) |
+| Graph | Kuzu (embedded, often empty) | Neo4j 5 (`neo4j` service, Bolt `:7687`) |
+| LLM | Ollama + Mistral (`host.docker.internal:11434`) | Azure OpenAI `gpt-4o` (HTTPS) |
+| Embeddings | `nomic-embed-text` 768D (Ollama) | `text-embedding-3-small` 1536D (Azure OpenAI) |
+| Vector | LanceDB 768D | LanceDB 1536D |
+| Security | (none) | `ENABLE_BACKEND_ACCESS_CONTROL`, `ACCEPT_LOCAL_FILE_PATH=False` |
 
-Applied mitigation:
+**Data compatibility**:
+- LanceDB tables from v1.1 use 768-dim vectors and are incompatible with the new embedder. Run `DELETE /api/v1/memory/prune` before first v2.0 run.
+- The old Kuzu-empty fallback code path is now dead code — retire it or keep as a diagnostic probe.
+- `graph_relationship_ledger` migrates from SQLite to Postgres; schema is otherwise identical.
 
-1. Graph extraction now prioritizes LanceDB + SQLite ledger.
-2. Kuzu graph engine is used as a secondary fallback only.
-3. Pipeline diagnostics are printed with each graph extraction run (grouped `pipeline_runs`, recent entries, ledger totals, Kuzu counts).
-
-Result:
-
-- Graph visualization and stats remain available even when Kuzu is not materialized.
-- Typed node distributions and relationship types are still recoverable from LanceDB + SQLite.
+**Startup dependencies** (critical for first boot):
+```
+db (healthy) ──┐
+               ├──► cognee-mcp ──► web
+neo4j (healthy)┘
+```
+A Postgres init script ([scripts/postgres-init/01-create-cognee-db.sh](scripts/postgres-init/01-create-cognee-db.sh)) provisions `cognee_db` alongside `workspace_db` on first boot only.
 

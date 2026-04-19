@@ -1,0 +1,184 @@
+@prefix bpi: <http://example.org/bpifrance#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+bpi: a owl:Ontology ;
+  rdfs:label "Bpifrance Document Ontology" .
+
+bpi:CorporateDocument a owl:Class .
+bpi:PolicyDocument a owl:Class ; rdfs:subClassOf bpi:CorporateDocument .
+bpi:AnnualReport a owl:Class ; rdfs:subClassOf bpi:Report .
+bpi:Report a owl:Class ; rdfs:subClassOf bpi:CorporateDocument .
+bpi:FinancialStatement a owl:Class ; rdfs:subClassOf bpi:Report .
+bpi:FrameworkDocument a owl:Class ; rdfs:subClassOf bpi:CorporateDocument .
+bpi:AmendmentDocument a owl:Class ; rdfs:subClassOf bpi:CorporateDocument .
+bpi:PressRelease a owl:Class ; rdfs:subClassOf bpi:CorporateDocument .
+
+bpi:Organization a owl:Class .
+bpi:Topic a owl:Class .
+
+bpi:hasTitle a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:string .
+bpi:sourcePdf a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:string .
+bpi:rawTextFile a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:string .
+bpi:numPages a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:integer .
+bpi:numCharacters a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:integer .
+bpi:publicationYear a owl:DatatypeProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range xsd:gYear .
+bpi:publishedBy a owl:ObjectProperty ; rdfs:domain bpi:CorporateDocument ; rdfs:range bpi:Organization .
+
+bpi:Bpifrance a bpi:Organization ;
+  rdfs:label "Bpifrance" .
+
+bpi:annual_report_2023_epic_bpifrance a bpi:AnnualReport ;
+  bpi:hasTitle "Annual Report 2023 EPIC Bpifrance" ;
+  bpi:sourcePdf "Annual Report 2023 EPIC Bpifrance.pdf" ;
+  bpi:rawTextFile "001_annual_report_2023_epic_bpifrance.txt" ;
+  bpi:numPages 72 ;
+  bpi:numCharacters 148787 ;
+  bpi:publicationYear "2023"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:bpifrance_amendment_1_dated_28_april_2023_to_the_2022_universal_registration_document a bpi:AmendmentDocument ;
+  bpi:hasTitle "Bpifrance - Amendment #1 dated 28 April 2023 to the 2022 Universal Registration Document" ;
+  bpi:sourcePdf "Bpifrance - Amendment #1 dated 28 April 2023 to the 2022 Universal Registration Document.pdf" ;
+  bpi:rawTextFile "002_bpifrance_amendment_1_dated_28_april_2023_to_the_2022_universal_registration_document.txt" ;
+  bpi:numPages 15 ;
+  bpi:numCharacters 34948 ;
+  bpi:publicationYear "2023"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:bpifrance_financement_amendement_urd_n1_18_juin_2020_english_vd a bpi:CorporateDocument ;
+  bpi:hasTitle "Bpifrance Financement-Amendement URD n1-18 juin 2020_ENGLISH VD" ;
+  bpi:sourcePdf "Bpifrance Financement-Amendement URD n1-18 juin 2020_ENGLISH VD.pdf" ;
+  bpi:rawTextFile "003_bpifrance_financement_amendement_urd_n1_18_juin_2020_english_vd.txt" ;
+  bpi:numPages 16 ;
+  bpi:numCharacters 33896 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:bpifrance_responsible_investment_report_2021 a bpi:Report ;
+  bpi:hasTitle "Bpifrance Responsible Investment Report 2021" ;
+  bpi:sourcePdf "Bpifrance Responsible Investment Report 2021.pdf" ;
+  bpi:rawTextFile "004_bpifrance_responsible_investment_report_2021.txt" ;
+  bpi:numPages 24 ;
+  bpi:numCharacters 61891 ;
+  bpi:publicationYear "2021"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:bpifrance_green_financing_framework_2026 a bpi:FrameworkDocument ;
+  bpi:hasTitle "Bpifrance_Green Financing Framework_2026" ;
+  bpi:sourcePdf "Bpifrance_Green Financing Framework_2026.pdf" ;
+  bpi:rawTextFile "005_bpifrance_green_financing_framework_2026.txt" ;
+  bpi:numPages 37 ;
+  bpi:numCharacters 100874 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:epic_bpifrance_annual_report_2024 a bpi:AnnualReport ;
+  bpi:hasTitle "EPIC Bpifrance - Annual Report 2024" ;
+  bpi:sourcePdf "EPIC Bpifrance - Annual Report 2024.pdf" ;
+  bpi:rawTextFile "006_epic_bpifrance_annual_report_2024.txt" ;
+  bpi:numPages 76 ;
+  bpi:numCharacters 149268 ;
+  bpi:publicationYear "2024"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:epic_rapport_annuel_2021_en_vdef a bpi:AnnualReport ;
+  bpi:hasTitle "EPIC Rapport annuel 2021 EN VDEF" ;
+  bpi:sourcePdf "EPIC Rapport annuel 2021 EN VDEF.pdf" ;
+  bpi:rawTextFile "007_epic_rapport_annuel_2021_en_vdef.txt" ;
+  bpi:numPages 85 ;
+  bpi:numCharacters 133639 ;
+  bpi:publicationYear "2021"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:epic_rapport_annuel_2022_v23_03_2023_en_vdef a bpi:AnnualReport ;
+  bpi:hasTitle "EPIC Rapport annuel 2022_v23.03.2023_EN_VDef" ;
+  bpi:sourcePdf "EPIC Rapport annuel 2022_v23.03.2023_EN_VDef.pdf" ;
+  bpi:rawTextFile "008_epic_rapport_annuel_2022_v23_03_2023_en_vdef.txt" ;
+  bpi:numPages 84 ;
+  bpi:numCharacters 138532 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:export_insurance_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Export-insurance-policy" ;
+  bpi:sourcePdf "Export-insurance-policy.pdf" ;
+  bpi:rawTextFile "009_export_insurance_policy.txt" ;
+  bpi:numPages 2 ;
+  bpi:numCharacters 7891 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:half_year_consolidated_financial_statements_30_june_2022 a bpi:FinancialStatement ;
+  bpi:hasTitle "Half-year Consolidated Financial Statements 30 June 2022" ;
+  bpi:sourcePdf "Half-year Consolidated Financial Statements 30 June 2022.pdf" ;
+  bpi:rawTextFile "010_half_year_consolidated_financial_statements_30_june_2022.txt" ;
+  bpi:numPages 51 ;
+  bpi:numCharacters 93271 ;
+  bpi:publicationYear "2022"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:half_year_consolidated_financial_statements_30_june_2023 a bpi:FinancialStatement ;
+  bpi:hasTitle "Half-year Consolidated Financial Statements 30 June 2023" ;
+  bpi:sourcePdf "Half-year Consolidated Financial Statements 30 June 2023.pdf" ;
+  bpi:rawTextFile "011_half_year_consolidated_financial_statements_30_june_2023.txt" ;
+  bpi:numPages 49 ;
+  bpi:numCharacters 118136 ;
+  bpi:publicationYear "2023"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:half_year_consolidated_financial_statements_30_june_2024 a bpi:FinancialStatement ;
+  bpi:hasTitle "Half-year Consolidated Financial Statements 30 June 2024" ;
+  bpi:sourcePdf "Half-year Consolidated Financial Statements 30 June 2024.pdf" ;
+  bpi:rawTextFile "012_half_year_consolidated_financial_statements_30_june_2024.txt" ;
+  bpi:numPages 47 ;
+  bpi:numCharacters 105375 ;
+  bpi:publicationYear "2024"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:innovation_financing_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Innovation-financing-policy" ;
+  bpi:sourcePdf "Innovation-financing-policy.pdf" ;
+  bpi:rawTextFile "013_innovation_financing_policy.txt" ;
+  bpi:numPages 11 ;
+  bpi:numCharacters 20723 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:investment_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Investment-policy" ;
+  bpi:sourcePdf "Investment-policy.pdf" ;
+  bpi:rawTextFile "014_investment_policy.txt" ;
+  bpi:numPages 17 ;
+  bpi:numCharacters 31326 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:press_release_bpifrance_2024_results_19_march_2025 a bpi:PressRelease ;
+  bpi:hasTitle "Press Release - Bpifrance 2024 Results -19 March 2025" ;
+  bpi:sourcePdf "Press Release - Bpifrance 2024 Results -19 March 2025.pdf" ;
+  bpi:rawTextFile "015_press_release_bpifrance_2024_results_19_march_2025.txt" ;
+  bpi:numPages 4 ;
+  bpi:numCharacters 9321 ;
+  bpi:publicationYear "2025"^^xsd:gYear ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:public_affairs_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Public-affairs-policy" ;
+  bpi:sourcePdf "Public-affairs-policy.pdf" ;
+  bpi:rawTextFile "016_public_affairs_policy.txt" ;
+  bpi:numPages 6 ;
+  bpi:numCharacters 10982 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:recruitment_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Recruitment-policy" ;
+  bpi:sourcePdf "Recruitment-policy.pdf" ;
+  bpi:rawTextFile "017_recruitment_policy.txt" ;
+  bpi:numPages 7 ;
+  bpi:numCharacters 11595 ;
+  bpi:publishedBy bpi:Bpifrance .
+
+bpi:supplier_policy a bpi:PolicyDocument ;
+  bpi:hasTitle "Supplier-policy" ;
+  bpi:sourcePdf "Supplier-policy.pdf" ;
+  bpi:rawTextFile "018_supplier_policy.txt" ;
+  bpi:numPages 5 ;
+  bpi:numCharacters 12596 ;
+  bpi:publishedBy bpi:Bpifrance .

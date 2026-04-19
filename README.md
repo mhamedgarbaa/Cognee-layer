@@ -1,185 +1,358 @@
-# FastAPI Template
+# Cognee Memory MCP Stack
 
-This repository provides a FastAPI project template following best practices for building scalable and maintainable backend APIs.
-
----
-
-## Architecture Overview
-
-The project follows a **3-layered architecture**:
-
-1. **Data Layer**
-   - Contains **SQLAlchemy models** and **repositories** for database operations.
-   - Responsible for persisting and fetching data.
-   - Example: `data/models`, `data/repositories`.
-
-2. **Service/Core Layer**
-   - Implements **business logic**.
-   - Interacts with repositories from the data layer.
-   - Raises **custom exceptions** for specific domain errors.
-   - Example: `service/workspace_service.py`.
-
-3. **API Layer**
-   - Exposes HTTP endpoints using **FastAPI routers**.
-   - Handles request validation, serialization, and response formatting using **Pydantic schemas**.
-   - Maps service exceptions to HTTP responses.
+A self-contained, graph-backed memory microservice for AI agents.
+Drop it into any agent stack and get persistent semantic memory via the
+**Model Context Protocol (MCP)** — no SDK required, just HTTP.
 
 ---
 
-## Exception Handling
+## What it does
 
-Exceptions are separated per layer:
+- Agents write facts/documents → Cognee extracts entities and builds a **Neo4j knowledge graph**
+- Agents query → semantic **graph completion** returns synthesized answers
+- Swap LLM backends by changing env vars (Ollama local or Azure OpenAI cloud)
 
-1. **API Layer Exceptions** (`api/exceptions.py`)
-   - Inherit from `fastapi.HTTPException`.
-   - Used to return standardized HTTP responses (e.g., 404 Not Found, 401 Unauthorized).
-     - Example: `NotFoundError`, `ConflictError`.
-
-2. **Service Layer Exceptions** (`service/exceptions.py`)
-   - Inherit from Python's base `Exception`.
-   - Represent business/domain errors.
-   - Example: `WorkspaceDoesNotExist`, `WorkspaceAlreadyExists`.
-
-3. **Centralized Error Handling Middleware**
-   - Catches uncaught exceptions.
-   - Converts service-layer exceptions into API responses with proper status codes.
-   - Ensures consistent logging and response format.
+```
+Your Agent  ──HTTP JSON-RPC──►  Cognee MCP :8001
+                                    │
+                            ┌───────┴────────┐
+                         Neo4j 5          Postgres 15
+                         (graph)          (metadata)
+                            └───────┬────────┘
+                                 LanceDB
+                                (vectors)
+```
 
 ---
 
-## Logging
+## Quick Start
 
-- Structured logging is configured globally in `config/logging.py`.
-- Logs are in JSON format for easy ingestion into observability systems.
-- **Logging Middleware** logs request start times and metadata (without sensitive payloads).
+### Prerequisites
+
+- Docker Desktop (or Docker + Compose v2)
+- For local LLM: **Ollama** running on the host with models pulled (see below)
+- For cloud LLM: Azure OpenAI resource with `gpt-4o` and `text-embedding-3-small` deployed
+
+### 1. Clone and configure
+
+```bash
+git clone <repo-url>
+cd cognee-layer
+cp example.env .env
+```
+
+Edit `.env` — minimum required:
+
+```env
+# --- Choose your LLM backend ---
+
+# Option A: Local Ollama (default)
+LLM_PROVIDER=ollama
+LLM_MODEL=qwen2.5:latest
+LLM_ENDPOINT=http://host.docker.internal:11434/v1
+LLM_API_KEY=ollama
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embeddings
+EMBEDDING_DIMENSIONS=768
+HUGGINGFACE_TOKENIZER=Salesforce/SFR-Embedding-Mistral
+
+# Option B: Azure OpenAI
+# LLM_PROVIDER=openai
+# LLM_MODEL=gpt-4o
+# LLM_ENDPOINT=https://<resource>.services.ai.azure.com/...
+# LLM_API_KEY=<key>
+# EMBEDDING_PROVIDER=openai
+# EMBEDDING_MODEL=text-embedding-3-small
+# EMBEDDING_ENDPOINT=https://<resource>.openai.azure.com/...
+# EMBEDDING_API_KEY=<key>
+# EMBEDDING_DIMENSIONS=1536
+```
+
+### 2. Pull Ollama models (local only)
+
+```bash
+ollama pull qwen2.5
+ollama pull nomic-embed-text
+```
+
+### 3. Start the stack
+
+```bash
+docker compose up -d
+```
+
+Services start in dependency order: `db` → `neo4j` → `cognee-mcp` → `web`.
+Wait ~60s for `cognee-mcp` to become healthy.
+
+```bash
+docker compose ps          # all should show "healthy" or "running"
+curl http://localhost:8001/health   # {"status":"ok"}
+curl http://localhost:8000/health   # {"status":"ok"}
+```
 
 ---
 
-## Middlewares
+## Expose the MCP Server to Your Agent
 
-Included middlewares:
-
-- **ErrorHandlerMiddleware**: centralized error handling.
-- **LoggingMiddleware**: logs request metadata before execution.
-- **TenantMiddleware** (optional): handles multi-tenant scenarios.
-- **CORS Middleware**: configured using environment variables in `AppConfig`.
-
----
-
-## API Versioning
-
-- The project supports **API versioning** to manage breaking changes while maintaining backward compatibility.
-
-  - Versioned API structure:
-    ```
-    api/
-      routers/
-        v1/
-        workspace_router.py
-
-        v2/
-        workspace_router.py
-    ```
-
-
-- **Fallback mechanism**:
-  - If an endpoint does not exist in `v2`, clients can still use the `v1` implementation.
-  - This allows incremental upgrades without breaking existing clients.
-
-- **Routing best practices**:
-  - The `/api` prefix is applied at the **application level** (`app.py`).
-  - Each router has a version-specific prefix (e.g., `/v1/workspaces`).
-  - Example URL for v1: `/api/v1/workspaces`
-  - Example URL for v2: `/api/v2/workspaces` (only modified endpoints need to be in v2)
-
-- **Summary**:
-  - Keep routers organized by version.
-  - Only add endpoints to v2 that have changes.
-  - Maintain v1 as the stable base for unchanged endpoints.
-  - This approach simplifies version management and ensures backward compatibility.
-
-
-## Dependency Injection (DI) & Dependencies
-
-- Dependency injection is managed using **FastAPI's built-in `Depends`**.
-- All services and repositories are provided through a **`dependencies.py` file** for consistent injection.
-- Example:
-  ```python
-  async def get_workspace_service(
-      repo: WorkspaceRepository = Depends(get_workspace_repository)
-  ) -> WorkspaceService:
-      return WorkspaceService(repo)
-    ```
-
-### API Layer (Schemas)
-- All incoming requests and outgoing responses are validated and serialized using **Pydantic schemas**.
-- Schemas define the **shape and types** of data exposed to API clients.
-- Example: `WorkspaceCreate`, `WorkspaceUpdate`, `WorkspaceResponse`.
+### Python agent (httpx)
 
 ```python
-from pydantic import BaseModel
+import httpx, json
 
-class WorkspaceCreate(BaseModel):
-    name: str
-    description: str
+MCP = "http://localhost:8001"
+HEADERS = {"Accept": "application/json, text/event-stream", "Host": "localhost:8001"}
+
+def sse(body): 
+    for line in body.splitlines():
+        if line.startswith("data:"): return json.loads(line[5:].strip())
+
+# 1. Initialize session
+resp = httpx.post(f"{MCP}/mcp", json={
+    "jsonrpc":"2.0","id":1,"method":"initialize",
+    "params":{"protocolVersion":"2024-11-05","capabilities":{},
+              "clientInfo":{"name":"my-agent","version":"1.0"}}
+}, headers=HEADERS)
+session_id = resp.headers["mcp-session-id"]
+headers = {**HEADERS, "mcp-session-id": session_id}
+
+# 2. Store knowledge
+httpx.post(f"{MCP}/mcp", json={
+    "jsonrpc":"2.0","id":2,"method":"tools/call",
+    "params":{"name":"cognify","arguments":{"data":"France 2030 budget is €30B","user":"agent1"}}
+}, headers=headers)
+
+# 3. Query knowledge
+result = sse(httpx.post(f"{MCP}/mcp", json={
+    "jsonrpc":"2.0","id":3,"method":"tools/call",
+    "params":{"name":"search","arguments":{
+        "search_query":"What is France 2030?",
+        "search_type":"GRAPH_COMPLETION","user":"agent1"}}
+}, headers=headers).text)
+print(result["result"]["content"][0]["text"])
 ```
 
-### Service Layer (DTOs / Domain Models)
- - The service layer uses DTOs (Data Transfer Objects) or domain models for internal operations.
-
-- These are independent from API schemas to maintain separation of concerns.
-
- - Conversions between schemas and DTOs are explicit, often via model_dump() or factory methods.
-
-### Data Layer (Database Models)
-
- - SQLAlchemy models represent tables and handle ORM mapping to the database.
-
- - Services interact with repositories using domain models, not directly with API schemas.
-
-
-### Pre-Commit Hooks
-- Pre-commit hooks are tools that run automatically before you commit changes to your version control system.
-- They help enforce code quality and consistency by running checks such as formatting, linting, and type checking
-
-#### Setting Up Pre-Commit Hooks
-
-
-
-Install the `pre-commit` package (globally or inside your virtual environment):
+### Via FastAPI memory API (higher-level)
 
 ```bash
-pip install pre-commit
+# Store a fact
+curl -X POST http://localhost:8000/api/v1/memory/record \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"agent1","fact":"France 2030 budget is 30 billion euros"}'
+
+# Recall with graph completion
+curl -X POST http://localhost:8000/api/v1/memory/recall \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"agent1","query":"What is France 2030?"}'
 ```
 
-Install Pre-Commit Hook in Your Repository:
+---
+
+## Build and Deploy as a Standalone Microservice
+
+Use this when you want to expose **only the MCP server** (no FastAPI web layer)
+so other agents on the network can connect to it.
+
+### Step 1 — Create a minimal compose file for the MCP service only
+
+```yaml
+# docker-compose.mcp-only.yml
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cognee_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cognee_pass}
+      POSTGRES_DB: cognee_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cognee_user} -d cognee_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_pass}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  cognee-mcp:
+    image: cognee/cognee-mcp:main
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    environment:
+      - TRANSPORT_MODE=http
+      - ALLOWED_HOSTS=*
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - EMBEDDING_ENDPOINT=${EMBEDDING_ENDPOINT}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-ollama}
+      - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
+      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-Salesforce/SFR-Embedding-Mistral}
+      - DB_PROVIDER=postgres
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=cognee_db
+      - DB_USERNAME=${POSTGRES_USER:-cognee_user}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-cognee_pass}
+      - VECTOR_DB_PROVIDER=lancedb
+      - GRAPH_DATABASE_PROVIDER=neo4j
+      - GRAPH_DATABASE_URL=bolt://neo4j:7687
+      - GRAPH_DATABASE_USERNAME=${NEO4J_USER:-neo4j}
+      - GRAPH_DATABASE_PASSWORD=${NEO4J_PASSWORD:-neo4j_pass}
+      - ENABLE_BACKEND_ACCESS_CONTROL=False
+      - ACCEPT_LOCAL_FILE_PATH=True
+      - REQUIRE_AUTHENTICATION=False
+    volumes:
+      - cognee_data:/root/.cognee_system
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  pgdata:
+  cognee_data:
+  neo4j_data:
+
+networks:
+  default:
+    name: cognee_mcp_net
+```
+
+### Step 2 — Start
 
 ```bash
-pre-commit install
+docker compose -f docker-compose.mcp-only.yml up -d
 ```
-#### ✅ 2. Create a `.pre-commit-config.yaml` File
-Create a `.pre-commit-config.yaml` file in the root of your repository with the following content:
 
+### Step 3 — Verify
 
-#### first usage(only first time):
 ```bash
-pre-commit run --all-files
+curl http://localhost:8001/health
+# {"status":"ok"}
 ```
 
-#### Used hooks:
+The MCP server is now accessible at **`http://<your-host-ip>:8001`** from any agent on your network.
 
-- isort: Automatically sorts imports to maintain consistency and uses the Black profile for compatibility.
-- black: Formats Python code to ensure a consistent code style.
-- flake8: Lints Python code to catch common errors and enforce style guidelines.
-- mypy: Performs static type checking to catch type-related issues.
-- check-added-large-files: Prevents committing files that are too large.
-- trailing-whitespace: Removes trailing whitespace from files.
-- end-of-file-fixer: Ensures files end with a single newline character.
+### Step 4 — Connect a remote agent
 
+```bash
+# From another machine on the same network
+MCP_URL=http://192.168.1.x:8001 python agent_chat.py
+```
 
-#### Usage
-- Pre-commit hooks run only on developer machines before committing code.
+Or set in the agent's env:
+```env
+MCP_URL=http://192.168.1.x:8001
+MCP_HOST_HEADER=localhost:8001
+```
 
-- They are not used in production and do not run on servers.
+---
 
-- Therefore, pre-commit should not be added to requirements.txt.
+## Interactive Agent UI
+
+A browser-based chat + document cognify interface powered by Groq (llama-4-scout):
+
+```bash
+# requires GROQ_API_KEY in .env
+python agent_server.py
+# open http://localhost:8080
+```
+
+| Panel | Function |
+|-------|----------|
+| Left — Chat | Talk to the Llama-4 agent; tool calls shown as pills in real-time |
+| Right — Cognify Document | Paste any text/document and store it in the Neo4j graph |
+
+---
+
+## Direct MCP Agent (CLI)
+
+Cognifies `bpi_france_events.json` directly against the MCP server — no FastAPI layer:
+
+```bash
+python test_agent_mcp.py
+# or against a remote MCP:
+MCP_URL=http://192.168.1.x:8001 python test_agent_mcp.py
+```
+
+---
+
+## Integration Tests
+
+```bash
+# against local stack
+pytest tests/test_stack_integration.py -v
+
+# against a remote host
+BASE_URL=http://<host>:8000 MCP_URL=http://<host>:8001 pytest tests/test_stack_integration.py -v
+```
+
+---
+
+## Neo4j Browser
+
+Explore the knowledge graph visually:
+
+```
+http://localhost:7474
+Login: neo4j / neo4j_pass
+```
+
+---
+
+## Switching LLM Backends
+
+Edit `.env`, then:
+
+```bash
+# If embedding dimensions changed (e.g. 768→1536), wipe the vector store first
+docker compose down
+docker volume rm cognee-layer_cognee_data
+
+# Restart with new config
+docker compose up -d
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `421 Invalid Host header` | Add `Host: localhost:8001` to all MCP requests |
+| `DatabaseNotCreatedError` after prune | Wait ~10s after first `cognify` call; DB setup is async |
+| `ContentTypeError 404` on embeddings | Set `EMBEDDING_ENDPOINT` to include the full path: `.../api/embeddings` |
+| `IngestionError: Local files are not accepted` | Set `ACCEPT_LOCAL_FILE_PATH=True` |
+| `IntegrityError: duplicate key "data_pkey"` | Harmless — same content hashes to same UUID; pipeline continues |
+| `GeminiException` / wrong provider | Check `LLM_PROVIDER` in container: `docker exec cognee_mcp_server env \| grep LLM` |
+| Embedding dimension mismatch | Wipe `cognee_data` volume and restart |

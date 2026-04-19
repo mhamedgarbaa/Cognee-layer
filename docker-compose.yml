@@ -1,31 +1,74 @@
 version: "3.9"
 
+# =====================================================================
+# Plug-and-Play MCP Architecture
+# ---------------------------------------------------------------------
+# - Postgres: shared relational store (app DB + cognee_db via init script)
+# - Neo4j:    graph backend for Cognee (replaces embedded Kuzu)
+# - OpenAI:   LLM + embeddings provider (replaces local Ollama)
+# - LanceDB:  kept as the vector store (file-backed inside cognee volume)
+# =====================================================================
+
 services:
   # ============================================
-  # PostgreSQL Database
+  # PostgreSQL - shared by FastAPI app and Cognee
   # ============================================
   db:
     image: postgres:15
     container_name: workspace_db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: workspace_user
-      POSTGRES_PASSWORD: workspace_pass
-      POSTGRES_DB: workspace_db
+      POSTGRES_USER: ${POSTGRES_USER:-workspace_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-workspace_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-workspace_db}
+      # Consumed by init script to provision a separate Cognee database
+      COGNEE_DB_NAME: ${COGNEE_DB_NAME:-cognee_db}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Creates cognee_db alongside the app DB on first boot
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     networks:
       - cognee_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U workspace_user -d workspace_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-workspace_user} -d ${POSTGRES_DB:-workspace_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # ============================================
+  # Neo4j - graph database backing Cognee
+  # ============================================
+  neo4j:
+    image: neo4j:5
+    container_name: workspace_neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP / Browser UI
+      - "7687:7687"   # Bolt protocol
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_pass}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    networks:
+      - cognee_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # ============================================
   # Cognee MCP - Memory Control Protocol server
+  # Now fully plug-and-play: OpenAI + Postgres + Neo4j
   # ============================================
   cognee-mcp:
     image: cognee/cognee-mcp:main
@@ -35,46 +78,75 @@ services:
       - "8001:8000"
     networks:
       - cognee_net
+    # Required so LLM_ENDPOINT=http://host.docker.internal:11434 reaches Ollama
+    # on the Docker host (auto on Docker Desktop, mandatory on Linux).
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
     environment:
-      # Transport and networking
+      # --- Transport / networking -------------------------------------
       - TRANSPORT_MODE=http
-      - ALLOWED_HOSTS=localhost,cognee-mcp,127.0.0.1,*.docker.internal,*
+      - ALLOWED_HOSTS=localhost,cognee-mcp,127.0.0.1,*
 
-      # LLM Configuration
-      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
-      - LLM_MODEL=${LLM_MODEL:-mistral}
-      # Using host.docker.internal to proxy from container to your local Ollama
-      - LLM_ENDPOINT=http://host.docker.internal:11434/v1
-      - LLM_API_KEY=${LLM_API_KEY:-ollama}
-      - LLM_FORMAT=${LLM_FORMAT:-json}
-      # Throttle request bursts to avoid Ollama timeout spikes under load
-      - LLM_RATE_LIMIT_ENABLED=true
-      - LLM_RATE_LIMIT_REQUESTS=2
-      - LLM_RATE_LIMIT_INTERVAL=10
+      # --- LLM (Ollama / OpenAI / Azure / compatible providers via env) ---
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-azure/kimi-K2.5}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
 
-      # Embedding Configuration
+      # --- Embeddings (Ollama / OpenAI via env) ---------------------
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
-      - EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embed
+      - EMBEDDING_ENDPOINT=${EMBEDDING_ENDPOINT:-http://host.docker.internal:11434/api/embeddings}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-ollama}
       - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
-      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-nomic-ai/nomic-embed-text-v1}
-      - EMBEDDING_RATE_LIMIT_ENABLED=true
-      - EMBEDDING_RATE_LIMIT_REQUESTS=4
-      - EMBEDDING_RATE_LIMIT_INTERVAL=10
+      # Cognee uses this tokenizer only for token counting when EMBEDDING_DIMENSIONS is set
+      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-Salesforce/SFR-Embedding-Mistral}
 
-      # Database Configuration
-      - DB_PROVIDER=sqlite
+      # --- Relational store: Postgres ---------------------------------
+      - DB_PROVIDER=postgres
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${COGNEE_DB_NAME:-cognee_db}
+      - DB_USERNAME=${POSTGRES_USER:-workspace_user}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-workspace_pass}
+
+      # --- Vector store: LanceDB (file-backed, kept as-is) -----------
       - VECTOR_DB_PROVIDER=lancedb
-      - GRAPH_DATABASE_PROVIDER=kuzu
 
-      # Logging
-      - MCP_LOG_LEVEL=INFO
+      # --- Graph store: Neo4j -----------------------------------------
+      - GRAPH_DATABASE_PROVIDER=neo4j
+      - GRAPH_DATABASE_URL=bolt://neo4j:7687
+      - GRAPH_DATABASE_USERNAME=${NEO4J_USER:-neo4j}
+      - GRAPH_DATABASE_PASSWORD=${NEO4J_PASSWORD:-neo4j_pass}
+
+      # --- Microservice security flags --------------------------------
+      # Neo4j provider does not support Cognee's multi-user access control handler.
+      # Must be False to allow `search` on the Neo4j-backed graph.
+      - ENABLE_BACKEND_ACCESS_CONTROL=False
+      # Must be True — Cognee saves interactions as local files in its own
+      # data directory and then reads them during cognify. Setting False
+      # blocks Cognee's own internal file access, not just user-supplied paths.
+      - ACCEPT_LOCAL_FILE_PATH=True
+      - REQUIRE_AUTHENTICATION=False
+
+      # --- Ontology (RDF/OWL for domain-specific entity types) --------
+      - ONTOLOGY_FILE_PATH=${ONTOLOGY_FILE_PATH:-/ontologies/bpifrance_ontology.ttl}
+      - ONTOLOGY_RESOLVER=rdflib
+      - MATCHING_STRATEGY=fuzzy
+
+      # --- Logging ----------------------------------------------------
+      - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
     volumes:
-      - cognee_data:/root/.cognee_system
+      - cognee_data:/app/.venv/lib/python3.12/site-packages/cognee/.cognee_system
+      - cognee_storage:/app/.venv/lib/python3.12/site-packages/cognee/.data_storage
+      - ./ontologies:/ontologies:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -91,27 +163,27 @@ services:
       - "8000:8000"
     networks:
       - cognee_net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       db:
+        condition: service_healthy
+      neo4j:
         condition: service_healthy
       cognee-mcp:
         condition: service_started
     environment:
-      # Database
-      POSTGRES_URI: "postgresql+asyncpg://workspace_user:workspace_pass@db:5432/workspace_db"
+      # Application database
+      POSTGRES_URI: "postgresql+asyncpg://${POSTGRES_USER:-workspace_user}:${POSTGRES_PASSWORD:-workspace_pass}@db:5432/${POSTGRES_DB:-workspace_db}"
       DB_HOST: "db"
 
-      # Cognee MCP configuration (Docker-internal service DNS)
+      # Cognee MCP (internal Docker DNS)
       MCP_SERVER_URL: "http://cognee-mcp:8000"
       MCP_PROTOCOL: "http"
       MCP_HOST_HEADER: "localhost:8001"
       MCP_TIMEOUT: "300"
 
       # App settings
-      APP_ENV: "development"
-      LOG_LEVEL: "INFO"
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./:/app
     command: [
@@ -122,7 +194,7 @@ services:
       "--reload"
     ]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -132,6 +204,14 @@ volumes:
   pgdata:
     driver: local
   cognee_data:
+    driver: local
+  cognee_storage:
+    driver: local
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  neo4j_plugins:
     driver: local
 
 networks:
