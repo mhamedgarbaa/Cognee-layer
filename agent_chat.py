@@ -31,30 +31,38 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-MCP_URL         = os.getenv("MCP_URL", "http://localhost:8001")
-MCP_HOST_HEADER = os.getenv("MCP_HOST_HEADER", "localhost:8001")
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL      = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-AGENT_USER      = os.getenv("AGENT_USER", "chat_user")
+MCP_URL      = os.getenv("MCP_URL", "http://localhost:8002")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+AGENT_USER   = os.getenv("AGENT_USER", "chat_user")
 
-MCP_HEADERS = {
-    "Accept": "application/json, text/event-stream",
-    "Host": MCP_HOST_HEADER,
-}
+MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
-SYSTEM_PROMPT = """You are a helpful memory assistant connected to a Cognee knowledge graph.
+SYSTEM_PROMPT = """You are a helpful memory assistant connected to a Cognee knowledge graph via the MCP Wrapper.
 
 You have access to the following tools:
-- **cognify**: Store and deeply process a piece of knowledge into the graph (use for facts, documents, complex content).
-- **save_interaction**: Quickly save a user interaction or short note (lighter than cognify).
-- **search**: Search the knowledge graph with a natural-language query.
-- **list_data**: Show what datasets are currently stored in the graph.
-- **prune**: Wipe all stored knowledge (use only when explicitly asked).
+
+WRITE:
+- **cognify**: Deep-process text into the graph (entity extraction, relationships). Use for facts, documents, rich content. Takes ~30s.
+- **save_interaction**: Quickly save a short note without full graph processing. Takes ~2s.
+- **memify**: Enrich stored chunks with temporal Event nodes (timestamps). Enables TEMPORAL search. Takes 1-3 minutes.
+- **persist_sessions**: Store a conversation transcript as graph nodes for future recall.
+- **improve_answer**: Re-query with chain-of-thought reasoning and store the corrected answer.
+
+READ:
+- **search**: Search the knowledge graph. Supports search_type: GRAPH_COMPLETION (default), TEMPORAL, CHUNKS, RAG_COMPLETION, CYPHER, and more.
+- **list_data**: List all datasets currently stored in the graph.
+- **cognify_status**: Check whether the cognify pipeline is idle or still running.
+- **visualize_graph**: Render the full knowledge graph as an interactive HTML file.
+
+ADMIN:
+- **prune**: Wipe ALL stored knowledge. Irreversible — only call when explicitly asked.
 
 Guidelines:
-- When a user shares information they want remembered, use `cognify` or `save_interaction`.
-- When a user asks a question that might be answered by stored knowledge, ALWAYS call `search` first.
-- Be concise and direct. After using a tool, summarize what you found or did.
+- When a user shares information to remember, use `cognify` (rich content) or `save_interaction` (short notes).
+- When a user asks a question, ALWAYS call `search` first before answering.
+- For time-related queries ("what happened last week?"), use search_type=TEMPORAL after running `memify`.
+- Be concise. After using a tool, summarize what you found or did in 1-2 sentences.
 - If search returns nothing useful, say so and answer from your own knowledge.
 """
 
@@ -178,6 +186,65 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cognify_status",
+            "description": "Check whether the cognify background pipeline is idle or still running.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memify",
+            "description": "Enrich stored document chunks with temporal Event nodes (timestamps) via LLM. Enables TEMPORAL search type. Takes 1-3 minutes — only run when the user wants time-aware search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Dataset name to enrich (default: main_dataset)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "visualize_graph",
+            "description": "Render the full Neo4j knowledge graph as an interactive HTML file. Call when the user asks to see or explore the graph visually.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "persist_sessions",
+            "description": "Store a conversation transcript as knowledge graph nodes so it can be recalled in future sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"type": "string", "description": "Conversation transcript to persist."},
+                },
+                "required": ["data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "improve_answer",
+            "description": "Re-query the graph with chain-of-thought reasoning and store the corrected answer. Use when a previous answer was wrong.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question":     {"type": "string", "description": "The original question."},
+                    "wrong_answer": {"type": "string", "description": "The incorrect answer that was given."},
+                    "feedback":     {"type": "string", "description": "What was wrong and what the correct answer should be."},
+                },
+                "required": ["question", "wrong_answer", "feedback"],
+            },
+        },
+    },
 ]
 
 
@@ -200,6 +267,20 @@ async def dispatch(mcp: MCPClient, name: str, args: dict) -> str:
             result = await mcp.call("list_data", {}, timeout=60)
         elif name == "prune":
             result = await mcp.call("prune", {}, timeout=60)
+        elif name == "cognify_status":
+            result = await mcp.call("cognify_status", {}, timeout=30)
+        elif name == "memify":
+            result = await mcp.call("memify", {"dataset": args.get("dataset", "main_dataset")}, timeout=300)
+        elif name == "visualize_graph":
+            result = await mcp.call("visualize_graph", {}, timeout=60)
+        elif name == "persist_sessions":
+            result = await mcp.call("persist_sessions", {"data": args["data"]}, timeout=120)
+        elif name == "improve_answer":
+            result = await mcp.call("improve_answer", {
+                "question":     args["question"],
+                "wrong_answer": args["wrong_answer"],
+                "feedback":     args["feedback"],
+            }, timeout=120)
         else:
             result = f"Unknown tool: {name}"
         print(f"  [tool: {name}] done — {result[:120].replace(chr(10), ' ')}")
@@ -218,7 +299,7 @@ async def chat_loop(mcp: MCPClient) -> None:
 
     print("\n" + "═" * 60)
     print("  Cognee Memory Agent  (model: llama-4-scout)")
-    print("  MCP server:", MCP_URL)
+    print("  MCP Wrapper:", MCP_URL, " | tools: 10")
     print("  Type 'quit' or Ctrl-C to exit.")
     print("═" * 60 + "\n")
 

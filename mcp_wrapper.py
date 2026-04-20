@@ -21,14 +21,17 @@ Tools exposed:
 
 import asyncio
 import json
+import logging
 import os
-import subprocess
+import secrets
 import sys
+import time
 import uuid
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 load_dotenv()
@@ -36,10 +39,33 @@ load_dotenv()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# ── config ────────────────────────────────────────────────────────────────────
+
 MCP_URL         = os.getenv("MCP_SERVER_URL", "http://localhost:8001")
 MCP_HOST_HEADER = os.getenv("MCP_HOST_HEADER", "localhost:8001")
 AGENT_USER      = os.getenv("AGENT_USER", "external_agent")
 PORT            = int(os.getenv("MCP_WRAPPER_PORT", "8002"))
+LOG_LEVEL       = os.getenv("MCP_WRAPPER_LOG_LEVEL", "INFO").upper()
+
+# Phase 2+ vars (defined now so .env.example documents them)
+MCP_WRAPPER_API_KEY         = os.getenv("MCP_WRAPPER_API_KEY", "")
+MCP_WRAPPER_STRICT_SESSIONS = os.getenv("MCP_WRAPPER_STRICT_SESSIONS", "false").lower() == "true"
+MCP_WRAPPER_RECONNECT_DELAY = int(os.getenv("MCP_WRAPPER_RECONNECT_DELAY", "5"))
+MCP_WRAPPER_MAX_RECONNECT   = int(os.getenv("MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS", "10"))
+# Container name and output path are env-driven so they work both locally and in Docker Compose
+COGNEE_CONTAINER_NAME       = os.getenv("COGNEE_CONTAINER_NAME", "cognee_mcp_server")
+GRAPH_OUTPUT_PATH           = os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html")
+# Gate streaming SSE forwarding — off by default so non-streaming clients keep working
+MCP_WRAPPER_STREAMING       = os.getenv("MCP_WRAPPER_STREAMING", "false").lower() == "true"
+# Tools that run a subprocess and need heartbeats instead of upstream SSE forwarding
+_SUBPROCESS_TOOLS: frozenset[str] = frozenset({"memify", "visualize_graph"})
+
+# ── JSON logger (shared config from configuration/logging_setup.py) ──────────
+# Importing applies the dictConfig; then we grab a named child logger.
+from configuration.logging_setup import logger as _root_logger  # noqa: E402
+
+log = _root_logger.getChild("mcp_wrapper")
+log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 # ── tool catalogue ─────────────────────────────────────────────────────────────
 
@@ -170,106 +196,435 @@ TOOL_LIST = [
 
 # ── Cognee MCP proxy ───────────────────────────────────────────────────────────
 
-_http: httpx.AsyncClient | None = None
-_session_id: str | None = None
-_id = 0
-_lock = asyncio.Lock()
+class CogneeMCPProxy:
+    """Resilient proxy to the upstream Cognee MCP server.
 
+    Handles lazy connect, transparent reconnect on failure, and a circuit
+    breaker that stops hammering the upstream after repeated failures.
+    """
 
-def _next_id() -> int:
-    global _id
-    _id += 1
-    return _id
+    _CB_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
+    _CB_TIMEOUT   = int(os.getenv("CIRCUIT_BREAKER_TIMEOUT",   "60"))
 
+    def __init__(self):
+        self._http: httpx.AsyncClient | None = None
+        self._session_id: str | None = None
+        self._req_id = 0
+        self._lock = asyncio.Lock()
+        self._connected = False
+        # circuit-breaker state
+        self._failures = 0
+        self._open_until: float = 0.0
 
-def _parse_sse(body: str) -> dict:
-    for line in body.splitlines():
-        if line.startswith("data:"):
-            return json.loads(line[5:].strip())
-    raise RuntimeError(f"No SSE data in: {body[:200]}")
+    # ── internal helpers ──────────────────────────────────────────────────────
 
+    def _next_id(self) -> int:
+        self._req_id += 1
+        return self._req_id
 
-async def cognee_call(tool: str, args: dict, timeout: float = 180) -> str:
-    global _http, _session_id
-    if _http is None:
-        _http = httpx.AsyncClient(base_url=MCP_URL, timeout=30)
-        resp = await _http.post(
+    @staticmethod
+    def _parse_sse(body: str) -> dict:
+        for line in body.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[5:].strip())
+        raise RuntimeError(f"No SSE data in: {body[:200]}")
+
+    def _mcp_headers(self, with_session: bool = False) -> dict:
+        h = {"Accept": "application/json, text/event-stream", "Host": MCP_HOST_HEADER}
+        if with_session and self._session_id:
+            h["mcp-session-id"] = self._session_id
+        return h
+
+    # ── circuit-breaker ───────────────────────────────────────────────────────
+
+    def _cb_open(self) -> bool:
+        return time.monotonic() < self._open_until
+
+    def _cb_record_failure(self):
+        self._failures += 1
+        if self._failures >= self._CB_THRESHOLD:
+            self._open_until = time.monotonic() + self._CB_TIMEOUT
+            log.error(
+                "circuit breaker OPEN — upstream unavailable",
+                extra={"tool": "proxy", "error": f"open for {self._CB_TIMEOUT}s"},
+            )
+
+    def _cb_record_success(self):
+        self._failures = 0
+        self._open_until = 0.0
+
+    # ── connect / reconnect ───────────────────────────────────────────────────
+
+    async def _do_connect(self):
+        if self._http:
+            await self._http.aclose()
+        self._http = httpx.AsyncClient(base_url=MCP_URL, timeout=30)
+        resp = await self._http.post(
             "/mcp",
             json={
-                "jsonrpc": "2.0", "id": _next_id(), "method": "initialize",
+                "jsonrpc": "2.0", "id": self._next_id(), "method": "initialize",
                 "params": {
                     "protocolVersion": "2024-11-05", "capabilities": {},
                     "clientInfo": {"name": "mcp-wrapper", "version": "1.0"},
                 },
             },
-            headers={"Accept": "application/json, text/event-stream", "Host": MCP_HOST_HEADER},
+            headers=self._mcp_headers(),
         )
         resp.raise_for_status()
-        _session_id = resp.headers.get("mcp-session-id")
+        self._session_id = resp.headers.get("mcp-session-id")
+        self._connected = True
+        self._cb_record_success()
+        log.info("Cognee MCP connected", extra={"session_id": self._session_id, "tool": "proxy"})
 
-    async with _lock:
-        resp = await _http.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
-                "params": {"name": tool, "arguments": args},
-            },
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Host": MCP_HOST_HEADER,
-                "mcp-session-id": _session_id,
-            },
-            timeout=timeout,
+    async def ensure_connected(self):
+        if self._connected:
+            return
+        async with self._lock:
+            if self._connected:   # double-check after acquiring lock
+                return
+            delay = MCP_WRAPPER_RECONNECT_DELAY
+            for attempt in range(1, MCP_WRAPPER_MAX_RECONNECT + 1):
+                try:
+                    log.info("Connecting to Cognee MCP (attempt %d/%d)", attempt, MCP_WRAPPER_MAX_RECONNECT,
+                             extra={"tool": "proxy"})
+                    await self._do_connect()
+                    return
+                except Exception as exc:
+                    self._connected = False
+                    self._cb_record_failure()
+                    log.warning("Connect attempt %d failed: %s", attempt, exc, extra={"tool": "proxy"})
+                    if attempt < MCP_WRAPPER_MAX_RECONNECT:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 60)   # exponential back-off, cap 60s
+            raise RuntimeError(
+                f"Could not connect to Cognee MCP after {MCP_WRAPPER_MAX_RECONNECT} attempts"
+            )
+
+    # ── public call interface ─────────────────────────────────────────────────
+
+    async def call(self, tool: str, args: dict, timeout: float = 180) -> str:
+        if self._cb_open():
+            raise RuntimeError(
+                f"Circuit breaker open — Cognee MCP unavailable. "
+                f"Retry in {round(self._open_until - time.monotonic())}s."
+            )
+
+        await self.ensure_connected()
+
+        t0 = time.monotonic()
+        try:
+            async with self._lock:
+                resp = await self._http.post(
+                    "/mcp",
+                    json={
+                        "jsonrpc": "2.0", "id": self._next_id(), "method": "tools/call",
+                        "params": {"name": tool, "arguments": args},
+                    },
+                    headers=self._mcp_headers(with_session=True),
+                    timeout=timeout,
+                )
+            resp.raise_for_status()
+            data = self._parse_sse(resp.text)
+            content = data.get("result", {}).get("content", [])
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            result = "\n".join(parts) or json.dumps(data.get("result", {}))
+            latency = round((time.monotonic() - t0) * 1000)
+            self._cb_record_success()
+            log.info("cognee_call ok", extra={"tool": tool, "latency_ms": latency})
+            return result
+
+        except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            # upstream went away — mark disconnected and let the caller surface the error
+            self._connected = False
+            self._cb_record_failure()
+            latency = round((time.monotonic() - t0) * 1000)
+            log.error("cognee_call failed (connection lost)",
+                      extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
+            raise
+
+        except httpx.HTTPStatusError as exc:
+            # 4xx/5xx — if session was invalidated, force reconnect next time
+            if exc.response.status_code in (401, 403, 404):
+                self._connected = False
+            self._cb_record_failure()
+            latency = round((time.monotonic() - t0) * 1000)
+            log.error("cognee_call HTTP error",
+                      extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
+            raise
+
+    async def stream_call(self, tool: str, args: dict, req_id, timeout: float = 180):
+        """Forward upstream SSE events as an async generator.
+
+        Yields raw 'data: {...}\\n\\n' lines so the caller can stream them
+        directly to the connecting agent without buffering the full response.
+        The final event has its JSON-RPC id rewritten to match req_id so the
+        agent's response correlates correctly.
+        """
+        if self._cb_open():
+            err = {"jsonrpc": "2.0", "id": req_id,
+                   "error": {"code": -32000, "message": "Circuit breaker open — upstream unavailable"}}
+            yield f"data: {json.dumps(err)}\n\n"
+            return
+
+        await self.ensure_connected()
+
+        t0 = time.monotonic()
+        try:
+            # No _lock here — httpx connection pool handles concurrent requests safely
+            async with self._http.stream(
+                "POST", "/mcp",
+                json={
+                    "jsonrpc": "2.0", "id": self._next_id(), "method": "tools/call",
+                    "params": {"name": tool, "arguments": args},
+                },
+                headers=self._mcp_headers(with_session=True),
+                timeout=timeout,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        try:
+                            event = json.loads(line[5:].strip())
+                            # Rewrite id so caller's response matches their request
+                            if "id" in event:
+                                event["id"] = req_id
+                        except json.JSONDecodeError:
+                            event = {"raw": line}
+                        yield f"data: {json.dumps(event)}\n\n"
+                    else:
+                        yield f"{line}\n\n"
+
+            latency = round((time.monotonic() - t0) * 1000)
+            self._cb_record_success()
+            log.info("stream_call ok", extra={"tool": tool, "latency_ms": latency})
+
+        except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            self._connected = False
+            self._cb_record_failure()
+            err = {"jsonrpc": "2.0", "id": req_id,
+                   "error": {"code": -32000, "message": f"Connection lost: {exc}"}}
+            yield f"data: {json.dumps(err)}\n\n"
+
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403, 404):
+                self._connected = False
+            self._cb_record_failure()
+            err = {"jsonrpc": "2.0", "id": req_id,
+                   "error": {"code": -32000, "message": f"Upstream HTTP {exc.response.status_code}"}}
+            yield f"data: {json.dumps(err)}\n\n"
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+
+# module-level singleton — all tool calls go through this
+proxy = CogneeMCPProxy()
+
+
+async def cognee_call(tool: str, args: dict, timeout: float = 180) -> str:
+    """Thin shim so existing code keeps working without changes."""
+    return await proxy.call(tool, args, timeout)
+
+
+# ── streaming helpers ──────────────────────────────────────────────────────────
+
+async def _stream_subprocess(tool_name: str, tool_args: dict, req_id):
+    """Run a subprocess tool in an executor and yield SSE heartbeats while it runs.
+
+    Subprocess tools (memify, visualize_graph) produce no intermediate output,
+    so we send MCP notifications/progress pings every 5 s to keep the connection
+    alive, then emit the final JSON-RPC result event.
+    """
+    loop = asyncio.get_event_loop()
+
+    # Dispatch to the right blocking function
+    if tool_name == "memify":
+        fn = lambda: asyncio.get_event_loop().run_until_complete(  # noqa: E731
+            run_memify(tool_args.get("dataset", "main_dataset"))
         )
-    resp.raise_for_status()
-    data = _parse_sse(resp.text)
-    content = data.get("result", {}).get("content", [])
-    parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
-    return "\n".join(parts) or json.dumps(data.get("result", {}))
+    else:
+        fn = lambda: asyncio.get_event_loop().run_until_complete(run_visualization())  # noqa: E731
+
+    # Run subprocess in a thread so we can yield while it runs
+    task = asyncio.ensure_future(
+        loop.run_in_executor(None, _sync_dispatch, tool_name, tool_args)
+    )
+
+    ping = {
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": req_id, "progress": 0, "total": 100},
+    }
+
+    while not task.done():
+        yield f"data: {json.dumps(ping)}\n\n"
+        try:
+            # Wait up to 5 s; shield prevents cancellation of the real task
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+    try:
+        result_text = task.result()
+    except Exception as exc:
+        result_text = f"Error: {exc}"
+
+    payload = {
+        "jsonrpc": "2.0", "id": req_id,
+        "result": {"content": [{"type": "text", "text": result_text}]},
+    }
+    yield f"data: {json.dumps(payload)}\n\n"
+
+
+def _sync_dispatch(tool_name: str, tool_args: dict) -> str:
+    """Blocking wrapper — runs the subprocess synchronously in a thread pool worker."""
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        if tool_name == "memify":
+            return loop.run_until_complete(run_memify(tool_args.get("dataset", "main_dataset")))
+        return loop.run_until_complete(run_visualization())
+    finally:
+        loop.close()
+
+
+async def stream_tool_result(tool_name: str, tool_args: dict, req_id, session_id: str, user: str):
+    """Top-level streaming generator for tools/call.
+
+    - Subprocess tools  → heartbeat pings + final result
+    - All other tools   → forward Cognee MCP SSE events in real time
+    """
+    log.info("stream start", extra={"tool": tool_name, "session_id": session_id})
+
+    if tool_name in _SUBPROCESS_TOOLS:
+        async for chunk in _stream_subprocess(tool_name, tool_args, req_id):
+            yield chunk
+        return
+
+    # Determine timeout by tool
+    _TIMEOUTS = {
+        "cognify": 300, "save_interaction": 120, "search": 180,
+        "persist_sessions": 300, "improve_answer": 180,
+    }
+    timeout = _TIMEOUTS.get(tool_name, 60)
+
+    async for chunk in proxy.stream_call(tool_name, tool_args, req_id, timeout=timeout):
+        yield chunk
 
 
 # ── custom tool implementations ────────────────────────────────────────────────
 
 async def run_memify(dataset: str = "main_dataset") -> str:
+    """Run memify inside the cognee container via the Python docker SDK."""
     loop = asyncio.get_event_loop()
-    def _exec():
-        r = subprocess.run(
-            ["docker", "exec", "cognee_mcp_server", "bash", "-c",
-             f"python3 /tmp/run_memify.py {dataset}"],
-            capture_output=True, text=True, timeout=300,
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        script = """
+import asyncio, os, sys
+sys.path.insert(0, '/app/src')
+import cognee
+dataset = sys.argv[1] if len(sys.argv) > 1 else 'main_dataset'
+
+async def run():
+    await cognee.cognee_init()
+    from cognee.modules.graph.utils.convert_node_to_event import convert_nodes_to_events
+    from cognee.infrastructure.databases.graph import get_graph_engine
+    graph = await get_graph_engine()
+    nodes, _ = await graph.get_graph_data()
+    chunks = [n for n in nodes if getattr(n, 'type', '') == 'DocumentChunk']
+    print(f'Found {len(chunks)} DocumentChunk nodes')
+    events = await convert_nodes_to_events(chunks)
+    print(f'Extracted {len(events)} Event nodes')
+
+asyncio.run(run())
+"""
+        # Upload script into container
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = script.encode()
+            info = _tar.TarInfo(name="run_memify_wrapper.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            f"python3 /tmp/run_memify_wrapper.py {dataset}",
+            stream=False,
         )
-        return r.stdout + r.stderr
+        text = output.decode(errors="replace") if output else ""
+        return text[-600:] or "Memify complete."
+
     output = await loop.run_in_executor(None, _exec)
-    return "\n".join(output.strip().splitlines()[-6:]) or "Memify complete."
+    return output or "Memify complete."
 
 
 async def run_visualization() -> str:
+    """Run the visualization script directly in this container (Neo4j reachable on Docker network).
+
+    /scripts is mounted read-only; output is written to GRAPH_OUTPUT_PATH on the shared volume.
+    """
     loop = asyncio.get_event_loop()
-    def _exec():
-        subprocess.run(
-            ["docker", "exec", "cognee_mcp_server", "bash", "-c", "python3 /tmp/visualize.py"],
-            capture_output=True, timeout=60,
+
+    def _exec() -> str:
+        import runpy, sys as _sys
+
+        # Override OUTPUT path so the script writes to the shared volume
+        os.environ.setdefault("GRAPH_DATABASE_URL",      "bolt://neo4j:7687")
+        os.environ.setdefault("GRAPH_DATABASE_USERNAME",  "neo4j")
+        os.environ.setdefault("GRAPH_DATABASE_PASSWORD",  os.getenv("NEO4J_PASSWORD", "neo4j_pass"))
+
+        script_path = "/scripts/visualize_neo4j_graph.py"
+        if not os.path.exists(script_path):
+            return f"Script not found: {script_path}"
+
+        # Patch OUTPUT constant before exec by injecting via env
+        import importlib.util, types
+        spec = importlib.util.spec_from_file_location("viz", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        # Override the OUTPUT path to write to the shared volume
+        mod.__dict__["__file__"] = script_path
+        # Read source and replace OUTPUT line
+        src = open(script_path).read().replace(
+            'OUTPUT     = "/tmp/cognee_graph.html"',
+            f'OUTPUT     = "{GRAPH_OUTPUT_PATH}"',
         )
-        return subprocess.run(
-            ["docker", "cp", "cognee_mcp_server:/tmp/cognee_graph.html",
-             "c:/Users/mhame/Cognee-layer/cognee_graph_neo4j.html"],
-            capture_output=True, timeout=10,
-        ).returncode
-    rc = await loop.run_in_executor(None, _exec)
-    return "Graph rendered at /tmp/cognee_graph.html" if rc == 0 else "Visualization failed."
+        try:
+            exec(compile(src, script_path, "exec"), mod.__dict__)
+            return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
+        except SystemExit:
+            return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
+        except Exception as e:
+            return f"Visualization error: {e}"
+
+    result = await loop.run_in_executor(None, _exec)
+    return result
 
 
-async def run_persist_sessions(data: str) -> str:
+async def run_persist_sessions(data: str, user: str = AGENT_USER) -> str:
     if not data.strip():
         return "No session data provided."
-    result = await cognee_call("cognify", {"data": data, "user": AGENT_USER}, timeout=300)
+    result = await cognee_call("cognify", {"data": data, "user": user}, timeout=300)
     return f"Session persisted to graph. {result[:200]}"
 
 
-async def run_improve_answer(question: str, wrong_answer: str, feedback: str) -> str:
+async def run_improve_answer(
+    question: str, wrong_answer: str, feedback: str, user: str = AGENT_USER
+) -> str:
     improved = await cognee_call(
         "search",
-        {"search_query": question, "search_type": "GRAPH_COMPLETION_COT", "user": AGENT_USER},
+        {"search_query": question, "search_type": "GRAPH_COMPLETION_COT", "user": user},
         timeout=180,
     )
     correction = (
@@ -277,55 +632,145 @@ async def run_improve_answer(question: str, wrong_answer: str, feedback: str) ->
         f"Wrong answer: {wrong_answer}\nFeedback: {feedback}\n"
         f"Improved answer: {improved}"
     )
-    await cognee_call("save_interaction", {"data": correction, "user": AGENT_USER}, timeout=120)
+    await cognee_call("cognify", {"data": correction, "user": user}, timeout=300)
     return f"Improved answer (stored):\n{improved}"
 
 
 # ── tool dispatcher ────────────────────────────────────────────────────────────
 
-async def dispatch(tool: str, args: dict) -> str:
-    user = args.get("user", AGENT_USER)
+async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGENT_USER) -> str:
+    t0 = time.monotonic()
 
-    if tool == "cognify":
-        return await cognee_call("cognify", {"data": args["data"], "user": user}, timeout=300)
-    if tool == "save_interaction":
-        return await cognee_call("save_interaction", {"data": args["data"], "user": user}, timeout=120)
-    if tool == "search":
-        return await cognee_call("search", {
-            "search_query": args.get("search_query", ""),
-            "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
-            "user": user,
-        }, timeout=180)
-    if tool == "list_data":
-        return await cognee_call("list_data", {}, timeout=60)
-    if tool == "cognify_status":
-        return await cognee_call("cognify_status", {}, timeout=30)
-    if tool == "prune":
-        return await cognee_call("prune", {}, timeout=60)
-    if tool == "memify":
-        return await run_memify(args.get("dataset", "main_dataset"))
-    if tool == "visualize_graph":
-        return await run_visualization()
-    if tool == "persist_sessions":
-        return await run_persist_sessions(args.get("data", ""))
-    if tool == "improve_answer":
-        return await run_improve_answer(
-            args.get("question", ""), args.get("wrong_answer", ""), args.get("feedback", "")
+    try:
+        if tool == "cognify":
+            result = await cognee_call("cognify", {"data": args["data"], "user": user}, timeout=300)
+        elif tool == "save_interaction":
+            # Cognee's save_interaction has a bug: it creates a TextDocument with a file
+            # path but never writes the file before the pipeline reads it. Routing to
+            # cognify uses the working code path with the same interface.
+            result = await cognee_call("cognify", {"data": args["data"], "user": user}, timeout=300)
+        elif tool == "search":
+            result = await cognee_call("search", {
+                "search_query": args.get("search_query", ""),
+                "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
+                "user": user,
+            }, timeout=180)
+        elif tool == "list_data":
+            result = await cognee_call("list_data", {}, timeout=60)
+        elif tool == "cognify_status":
+            result = await cognee_call("cognify_status", {}, timeout=30)
+        elif tool == "prune":
+            result = await cognee_call("prune", {}, timeout=60)
+        elif tool == "memify":
+            result = await run_memify(args.get("dataset", "main_dataset"))
+        elif tool == "visualize_graph":
+            result = await run_visualization()
+        elif tool == "persist_sessions":
+            result = await run_persist_sessions(args.get("data", ""), user=user)
+        elif tool == "improve_answer":
+            result = await run_improve_answer(
+                args.get("question", ""), args.get("wrong_answer", ""), args.get("feedback", ""),
+                user=user,
+            )
+        else:
+            result = f"Unknown tool: {tool}"
+
+        latency = round((time.monotonic() - t0) * 1000)
+        log.info("dispatch ok", extra={"tool": tool, "session_id": session_id, "latency_ms": latency})
+        return result
+
+    except Exception as exc:
+        latency = round((time.monotonic() - t0) * 1000)
+        log.error(
+            "dispatch error",
+            extra={"tool": tool, "session_id": session_id, "latency_ms": latency, "error": str(exc)},
+            exc_info=True,
         )
-    return f"Unknown tool: {tool}"
+        raise
 
 
 # ── MCP protocol handler ───────────────────────────────────────────────────────
 
-app = FastAPI(title="Cognee MCP Wrapper")
+SESSION_TTL_SECONDS = int(os.getenv("MCP_WRAPPER_SESSION_TTL", "3600"))
 
-# Active sessions: session_id → {}
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Background task to evict stale sessions."""
+    async def _evict_loop():
+        while True:
+            await asyncio.sleep(300)  # check every 5 minutes
+            now = time.time()
+            stale = [
+                sid for sid, s in _sessions.items()
+                if now - s.get("created_at", now) > SESSION_TTL_SECONDS
+            ]
+            for sid in stale:
+                _sessions.pop(sid, None)
+            if stale:
+                log.info("evicted %d stale session(s)", len(stale))
+
+    # Quick single-attempt connect at startup (5 s timeout).
+    # Full retry logic runs on first tool call — don't block uvicorn startup.
+    try:
+        await asyncio.wait_for(proxy._do_connect(), timeout=5.0)
+    except Exception as exc:
+        proxy._connected = False
+        log.warning("Startup: Cognee MCP not reachable (%s) — will retry on first call", exc,
+                    extra={"tool": "proxy"})
+
+    task = asyncio.create_task(_evict_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        if proxy._http:
+            await proxy._http.aclose()
+
+
+app = FastAPI(title="Cognee MCP Wrapper", lifespan=_lifespan)
+
+# Active sessions: session_id → {"agent_id": str, "created_at": float}
 _sessions: dict[str, dict] = {}
 
 
-def _sse_response(payload: dict) -> StreamingResponse:
+def _sse_response(payload: dict, headers: dict | None = None) -> StreamingResponse:
     data = f"data: {json.dumps(payload)}\n\n"
-    return StreamingResponse(iter([data]), media_type="text/event-stream")
+    return StreamingResponse(iter([data]), media_type="text/event-stream", headers=headers or {})
+
+
+def _wants_sse(request: Request) -> bool:
+    accept = request.headers.get("accept", "")
+    return "text/event-stream" in accept
+
+
+def _jsonrpc_error(req_id, code: int, message: str):
+    return JSONResponse(
+        status_code=400,
+        content={"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}},
+    )
+
+
+def _validate_session(sid: str, req_id) -> JSONResponse | None:
+    """Return an error response if session is required and invalid, else None."""
+    if not MCP_WRAPPER_STRICT_SESSIONS:
+        return None
+    if not sid:
+        return _jsonrpc_error(req_id, -32000, "Missing mcp-session-id header — call initialize first")
+    if sid not in _sessions:
+        return _jsonrpc_error(req_id, -32000, "Unknown or expired session — call initialize again")
+    return None
+
+
+def _session_user(sid: str) -> str:
+    """Return the agent_id bound to this session, falling back to AGENT_USER.
+
+    Using session-bound identity prevents callers from spoofing another
+    agent's user context by passing 'user' in tool arguments.
+    """
+    if sid and sid in _sessions:
+        return _sessions[sid]["agent_id"]
+    return AGENT_USER
 
 
 @app.post("/mcp")
@@ -333,11 +778,14 @@ async def mcp_endpoint(request: Request):
     body = await request.json()
     method = body.get("method")
     req_id = body.get("id")
+    sid = request.headers.get("mcp-session-id", "")
 
     # ── initialize ──
     if method == "initialize":
         session_id = str(uuid.uuid4())
-        _sessions[session_id] = {}
+        agent_name = body.get("params", {}).get("clientInfo", {}).get("name", "unknown")
+        _sessions[session_id] = {"agent_id": agent_name, "created_at": time.time()}
+        log.info("session init", extra={"session_id": session_id, "tool": f"agent={agent_name}"})
         payload = {
             "jsonrpc": "2.0", "id": req_id,
             "result": {
@@ -346,21 +794,43 @@ async def mcp_endpoint(request: Request):
                 "serverInfo": {"name": "cognee-mcp-wrapper", "version": "1.0"},
             },
         }
-        return _sse_response(payload) if _wants_sse(request) else JSONResponse(
-            content=payload, headers={"mcp-session-id": session_id}
-        )
+        resp_headers = {"mcp-session-id": session_id}
+        if _wants_sse(request):
+            return StreamingResponse(
+                iter([f"data: {json.dumps(payload)}\n\n"]),
+                media_type="text/event-stream",
+                headers=resp_headers,
+            )
+        return JSONResponse(content=payload, headers=resp_headers)
 
     # ── tools/list ──
     if method == "tools/list":
+        if err := _validate_session(sid, req_id):
+            log.warning("rejected tools/list: invalid session", extra={"session_id": sid})
+            return err
+        log.info("tools/list", extra={"session_id": sid})
         payload = {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_LIST}}
         return _sse_response(payload)
 
     # ── tools/call ──
     if method == "tools/call":
+        if err := _validate_session(sid, req_id):
+            log.warning("rejected tools/call: invalid session", extra={"session_id": sid})
+            return err
         tool_name = body["params"]["name"]
         tool_args = body["params"].get("arguments", {})
+        agent_user = _session_user(sid)
+
+        if MCP_WRAPPER_STREAMING:
+            # Stream SSE events incrementally — no buffering
+            return StreamingResponse(
+                stream_tool_result(tool_name, tool_args, req_id, sid, agent_user),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming (default) — buffer full result, emit single SSE event
         try:
-            result_text = await dispatch(tool_name, tool_args)
+            result_text = await dispatch(tool_name, tool_args, session_id=sid, user=agent_user)
         except Exception as exc:
             result_text = f"Error: {exc}"
         payload = {
@@ -369,24 +839,74 @@ async def mcp_endpoint(request: Request):
         }
         return _sse_response(payload)
 
-    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}})
+    log.warning("unknown method: %s", method, extra={"session_id": sid})
+    return JSONResponse({
+        "jsonrpc": "2.0", "id": req_id,
+        "error": {"code": -32601, "message": f"Unknown method: {method}"},
+    })
 
 
-def _wants_sse(request: Request) -> bool:
-    accept = request.headers.get("accept", "")
-    return "text/event-stream" in accept
+_start_time = time.time()
+
+# ── Phase 7: tool documentation metadata ──────────────────────────────────────
+
+_TOOL_METADATA: dict[str, dict] = {
+    "cognify":           {"category": "write", "typical_latency_seconds": 30},
+    "save_interaction":  {"category": "write", "typical_latency_seconds": 2},
+    "search":            {"category": "read",  "typical_latency_seconds": 5},
+    "list_data":         {"category": "read",  "typical_latency_seconds": 2},
+    "cognify_status":    {"category": "read",  "typical_latency_seconds": 1},
+    "prune":             {"category": "admin", "typical_latency_seconds": 5},
+    "memify":            {"category": "write", "typical_latency_seconds": 120},
+    "visualize_graph":   {"category": "read",  "typical_latency_seconds": 15},
+    "persist_sessions":  {"category": "write", "typical_latency_seconds": 10},
+    "improve_answer":    {"category": "write", "typical_latency_seconds": 10},
+}
+
+
+@app.get("/tools")
+async def list_tools_doc():
+    enriched = []
+    for tool in TOOL_LIST:
+        meta = _TOOL_METADATA.get(tool["name"], {})
+        enriched.append({**tool, **meta})
+    return {
+        "server": {
+            "name": "cognee-mcp-wrapper",
+            "version": "1.0.0",
+            "mcp_endpoint": "/mcp",
+            "auth": "none" if not MCP_WRAPPER_API_KEY else "x-api-key header",
+        },
+        "session_handshake": {
+            "step_1": "POST /mcp  method=initialize  →  mcp-session-id header returned",
+            "step_2": "POST /mcp  method=tools/list   mcp-session-id: <id>",
+            "step_3": "POST /mcp  method=tools/call   mcp-session-id: <id>",
+        },
+        "tool_count": len(enriched),
+        "tools": enriched,
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "tools": len(TOOL_LIST)}
+    cb_open = proxy._cb_open()
+    return {
+        "status": "degraded" if cb_open else "ok",
+        "tools": len(TOOL_LIST),
+        "uptime_seconds": round(time.time() - _start_time),
+        "active_sessions": len(_sessions),
+        "cognee_mcp_connected": proxy.connected,
+        "circuit_breaker_open": cb_open,
+        "consecutive_failures": proxy._failures,
+    }
 
 
 # ── run ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Cognee MCP Wrapper starting on http://0.0.0.0:{PORT}")
-    print(f"MCP endpoint: POST http://localhost:{PORT}/mcp")
-    print(f"Tools: {[t['name'] for t in TOOL_LIST]}")
+    log.info(
+        "MCP Wrapper starting",
+        extra={"tool": f"port={PORT} tools={len(TOOL_LIST)} log_level={LOG_LEVEL}"},
+    )
     uvicorn.run("mcp_wrapper:app", host="0.0.0.0", port=PORT, reload=False)

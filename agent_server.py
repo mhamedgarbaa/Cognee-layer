@@ -395,17 +395,20 @@ async def run_improve_answer(question: str, wrong_answer: str, feedback: str) ->
     return f"Improved answer (stored in graph):\n{improved}"
 
 
+COGNEE_CONTAINER = os.getenv("COGNEE_CONTAINER_NAME", "cognee_mcp_server")
+GRAPH_HTML_PATH  = os.getenv("GRAPH_OUTPUT_PATH", "c:/Users/mhame/Cognee-layer/cognee_graph_neo4j.html")
+
+
 async def run_visualization() -> str:
     """Execute the visualization script inside the cognee-mcp container and cache the HTML."""
     loop = asyncio.get_event_loop()
     def _exec():
         subprocess.run(
-            ["docker", "exec", "cognee_mcp_server", "bash", "-c", "python3 /tmp/visualize.py"],
+            ["docker", "exec", COGNEE_CONTAINER, "bash", "-c", "python3 /tmp/visualize.py"],
             capture_output=True, timeout=60,
         )
         result = subprocess.run(
-            ["docker", "cp", "cognee_mcp_server:/tmp/cognee_graph.html",
-             "c:/Users/mhame/Cognee-layer/cognee_graph_neo4j.html"],
+            ["docker", "cp", f"{COGNEE_CONTAINER}:/tmp/cognee_graph.html", GRAPH_HTML_PATH],
             capture_output=True, timeout=10,
         )
         return result.returncode
@@ -413,7 +416,7 @@ async def run_visualization() -> str:
     rc = await loop.run_in_executor(None, _exec)
     if rc == 0:
         return "Graph rendered. Open it at: http://localhost:8080/api/graph"
-    return "Visualization failed — check docker logs cognee_mcp_server"
+    return f"Visualization failed — check docker logs {COGNEE_CONTAINER}"
 
 # ── API models ────────────────────────────────────────────────────────────────
 
@@ -513,7 +516,7 @@ async def cognify_doc(req: CognifyRequest):
 async def serve_graph():
     """Render a fresh graph visualization and serve it inline."""
     await run_visualization()
-    path = "c:/Users/mhame/Cognee-layer/cognee_graph_neo4j.html"
+    path = GRAPH_HTML_PATH
     try:
         with open(path, encoding="utf-8") as f:
             content = f.read()

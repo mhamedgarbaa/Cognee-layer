@@ -6,22 +6,44 @@ Drop it into any agent stack and get persistent semantic memory via the
 
 ---
 
-## What it does
-
-- Agents write facts/documents → Cognee extracts entities and builds a **Neo4j knowledge graph**
-- Agents query → semantic **graph completion** returns synthesized answers
-- Swap LLM backends by changing env vars (Ollama local or Azure OpenAI cloud)
+## Architecture
 
 ```
-Your Agent  ──HTTP JSON-RPC──►  Cognee MCP :8001
-                                    │
-                            ┌───────┴────────┐
-                         Neo4j 5          Postgres 15
-                         (graph)          (metadata)
-                            └───────┬────────┘
-                                 LanceDB
-                                (vectors)
+External Agents / Claude / LangChain
+          │
+          │ HTTP JSON-RPC 2.0
+          ▼
+ ┌─────────────────────────┐
+ │  MCP Wrapper  :8002     │  ← primary agent entry point
+ │  10 tools exposed       │
+ │  session management     │
+ │  circuit breaker        │
+ └────────────┬────────────┘
+              │ proxy (8 tools) + docker exec (2 tools)
+              ▼
+ ┌─────────────────────────┐
+ │  Cognee MCP   :8001     │  ← core memory engine
+ └────────────┬────────────┘
+              │
+     ┌────────┴────────┐
+     ▼                 ▼
+  Neo4j 5          Postgres 15
+  (graph)          (metadata)
+     └────────┬────────┘
+              ▼
+           LanceDB
+          (vectors)
+              │
+              ▼
+    OpenAI / Azure OpenAI
+    (LLM + embeddings)
+
+ ┌─────────────────────────┐
+ │  FastAPI Web  :8000     │  ← higher-level REST memory API
+ └─────────────────────────┘
 ```
+
+Five Docker services: `db` → `neo4j` → `cognee-mcp` → `mcp-wrapper` → `web`
 
 ---
 
@@ -30,109 +52,167 @@ Your Agent  ──HTTP JSON-RPC──►  Cognee MCP :8001
 ### Prerequisites
 
 - Docker Desktop (or Docker + Compose v2)
-- For local LLM: **Ollama** running on the host with models pulled (see below)
-- For cloud LLM: Azure OpenAI resource with `gpt-4o` and `text-embedding-3-small` deployed
+- OpenAI or Azure OpenAI API key
 
 ### 1. Clone and configure
 
 ```bash
 git clone <repo-url>
 cd cognee-layer
-cp example.env .env
+cp .env.example .env
 ```
 
-Edit `.env` — minimum required:
+Minimum required in `.env`:
 
 ```env
-# --- Choose your LLM backend ---
+# LLM — OpenAI
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o
+LLM_ENDPOINT=https://api.openai.com/v1
+LLM_API_KEY=sk-...
 
-# Option A: Local Ollama (default)
-LLM_PROVIDER=ollama
-LLM_MODEL=qwen2.5:latest
-LLM_ENDPOINT=http://host.docker.internal:11434/v1
-LLM_API_KEY=ollama
-EMBEDDING_PROVIDER=ollama
-EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embeddings
-EMBEDDING_DIMENSIONS=768
-HUGGINGFACE_TOKENIZER=Salesforce/SFR-Embedding-Mistral
+# Embeddings
+EMBEDDING_PROVIDER=openai
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_ENDPOINT=https://api.openai.com/v1
+EMBEDDING_API_KEY=sk-...
+EMBEDDING_DIMENSIONS=1536
 
-# Option B: Azure OpenAI
-# LLM_PROVIDER=openai
-# LLM_MODEL=gpt-4o
-# LLM_ENDPOINT=https://<resource>.services.ai.azure.com/...
-# LLM_API_KEY=<key>
-# EMBEDDING_PROVIDER=openai
-# EMBEDDING_MODEL=text-embedding-3-small
-# EMBEDDING_ENDPOINT=https://<resource>.openai.azure.com/...
-# EMBEDDING_API_KEY=<key>
-# EMBEDDING_DIMENSIONS=1536
+# Databases (defaults work out of the box)
+POSTGRES_USER=workspace_user
+POSTGRES_PASSWORD=workspace_pass
+NEO4J_PASSWORD=neo4j_pass
 ```
 
-### 2. Pull Ollama models (local only)
+For Azure OpenAI, set `LLM_ENDPOINT` to your deployment URL and `LLM_MODEL=azure/<deployment-name>`.
 
-```bash
-ollama pull qwen2.5
-ollama pull nomic-embed-text
-```
+For local Ollama, see the [Switching LLM Backends](#switching-llm-backends) section below.
 
-### 3. Start the stack
+### 2. Start the stack
 
 ```bash
 docker compose up -d
 ```
 
-Services start in dependency order: `db` → `neo4j` → `cognee-mcp` → `web`.
-Wait ~60s for `cognee-mcp` to become healthy.
+Wait ~60s for `cognee-mcp` to become healthy, then verify:
 
 ```bash
-docker compose ps          # all should show "healthy" or "running"
-curl http://localhost:8001/health   # {"status":"ok"}
-curl http://localhost:8000/health   # {"status":"ok"}
+docker compose ps
+curl http://localhost:8002/health   # MCP Wrapper
+curl http://localhost:8000/health   # FastAPI
 ```
 
 ---
 
-## Expose the MCP Server to Your Agent
+## Connecting an Agent
 
-### Python agent (httpx)
+### Discover available tools
+
+```bash
+curl http://localhost:8002/tools
+```
+
+Returns all 10 tools with `inputSchema`, `category`, `typical_latency_seconds`, and step-by-step session handshake instructions.
+
+### Session handshake (required before tool calls)
 
 ```python
 import httpx, json
 
-MCP = "http://localhost:8001"
-HEADERS = {"Accept": "application/json, text/event-stream", "Host": "localhost:8001"}
+BASE = "http://localhost:8002"
 
-def sse(body): 
-    for line in body.splitlines():
-        if line.startswith("data:"): return json.loads(line[5:].strip())
+def parse_sse(text):
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:].strip())
 
-# 1. Initialize session
-resp = httpx.post(f"{MCP}/mcp", json={
-    "jsonrpc":"2.0","id":1,"method":"initialize",
-    "params":{"protocolVersion":"2024-11-05","capabilities":{},
-              "clientInfo":{"name":"my-agent","version":"1.0"}}
-}, headers=HEADERS)
-session_id = resp.headers["mcp-session-id"]
-headers = {**HEADERS, "mcp-session-id": session_id}
+client = httpx.Client(timeout=60)
 
-# 2. Store knowledge
-httpx.post(f"{MCP}/mcp", json={
-    "jsonrpc":"2.0","id":2,"method":"tools/call",
-    "params":{"name":"cognify","arguments":{"data":"France 2030 budget is €30B","user":"agent1"}}
-}, headers=headers)
+# Step 1 — initialize session
+r = client.post(f"{BASE}/mcp", json={
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "my-agent", "version": "1.0"},
+    },
+})
+session_id = r.headers["mcp-session-id"]
+headers = {"mcp-session-id": session_id}
 
-# 3. Query knowledge
-result = sse(httpx.post(f"{MCP}/mcp", json={
-    "jsonrpc":"2.0","id":3,"method":"tools/call",
-    "params":{"name":"search","arguments":{
-        "search_query":"What is France 2030?",
-        "search_type":"GRAPH_COMPLETION","user":"agent1"}}
-}, headers=headers).text)
+# Step 2 — store knowledge
+client.post(f"{BASE}/mcp", headers=headers, json={
+    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+    "params": {"name": "cognify", "arguments": {
+        "data": "France 2030 plan allocated €30B for deep tech startups."
+    }},
+})
+
+# Step 3 — query knowledge
+result = parse_sse(client.post(f"{BASE}/mcp", headers=headers, json={
+    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+    "params": {"name": "search", "arguments": {
+        "search_query": "What is the France 2030 budget?",
+        "search_type": "GRAPH_COMPLETION",
+    }},
+}).text)
 print(result["result"]["content"][0]["text"])
 ```
 
-### Via FastAPI memory API (higher-level)
+### Async Python (httpx)
+
+```python
+import asyncio, httpx, json
+
+async def main():
+    async with httpx.AsyncClient(base_url="http://localhost:8002", timeout=60) as client:
+        r = await client.post("/mcp", json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "async-agent", "version": "1.0"}},
+        })
+        sid = r.headers["mcp-session-id"]
+
+        r = await client.post("/mcp", headers={"mcp-session-id": sid}, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "search", "arguments": {
+                "search_query": "France 2030",
+                "search_type": "GRAPH_COMPLETION",
+            }},
+        })
+        for line in r.text.splitlines():
+            if line.startswith("data:"):
+                print(json.loads(line[5:])["result"]["content"][0]["text"])
+
+asyncio.run(main())
+```
+
+---
+
+## Available Tools
+
+| Tool | Category | Latency | Description |
+|------|----------|---------|-------------|
+| `cognify` | write | ~30s | Deep-process text into the knowledge graph |
+| `save_interaction` | write | ~2s | Quickly save a short note without full graph processing |
+| `search` | read | ~5s | Query the graph (11 search types) |
+| `list_data` | read | ~2s | List all stored datasets |
+| `cognify_status` | read | ~1s | Check if the cognify pipeline is running or idle |
+| `prune` | admin | ~5s | Wipe ALL stored knowledge (irreversible) |
+| `memify` | write | ~120s | Extract temporal Event nodes from stored chunks |
+| `visualize_graph` | read | ~15s | Render the full graph as interactive HTML |
+| `persist_sessions` | write | ~10s | Store agent conversation transcripts as graph nodes |
+| `improve_answer` | write | ~10s | Re-query with chain-of-thought and store corrected answer |
+
+### Search types for `search`
+
+`GRAPH_COMPLETION` · `GRAPH_COMPLETION_COT` · `GRAPH_COMPLETION_CONTEXT_EXTENSION` · `GRAPH_SUMMARY_COMPLETION` · `TEMPORAL` · `CYPHER` · `NATURAL_LANGUAGE` · `RAG_COMPLETION` · `SUMMARIES` · `CHUNKS` · `FEELING_LUCKY`
+
+---
+
+## FastAPI Memory API (higher-level)
+
+The `web` service exposes a REST API over the same memory backend:
 
 ```bash
 # Store a fact
@@ -140,169 +220,49 @@ curl -X POST http://localhost:8000/api/v1/memory/record \
   -H "Content-Type: application/json" \
   -d '{"user_id":"agent1","fact":"France 2030 budget is 30 billion euros"}'
 
-# Recall with graph completion
+# Recall with graph completion (3-tier circuit breaker fallback)
 curl -X POST http://localhost:8000/api/v1/memory/recall \
   -H "Content-Type: application/json" \
   -d '{"user_id":"agent1","query":"What is France 2030?"}'
-```
 
----
-
-## Build and Deploy as a Standalone Microservice
-
-Use this when you want to expose **only the MCP server** (no FastAPI web layer)
-so other agents on the network can connect to it.
-
-### Step 1 — Create a minimal compose file for the MCP service only
-
-```yaml
-# docker-compose.mcp-only.yml
-version: "3.9"
-
-services:
-  db:
-    image: postgres:15
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-cognee_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cognee_pass}
-      POSTGRES_DB: cognee_db
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cognee_user} -d cognee_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  neo4j:
-    image: neo4j:5
-    restart: unless-stopped
-    environment:
-      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_pass}
-      NEO4J_PLUGINS: '["apoc"]'
-    volumes:
-      - neo4j_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 40s
-
-  cognee-mcp:
-    image: cognee/cognee-mcp:main
-    restart: unless-stopped
-    ports:
-      - "8001:8000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      db:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    environment:
-      - TRANSPORT_MODE=http
-      - ALLOWED_HOSTS=*
-      - LLM_PROVIDER=${LLM_PROVIDER}
-      - LLM_MODEL=${LLM_MODEL}
-      - LLM_ENDPOINT=${LLM_ENDPOINT}
-      - LLM_API_KEY=${LLM_API_KEY}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
-      - EMBEDDING_ENDPOINT=${EMBEDDING_ENDPOINT}
-      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-ollama}
-      - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
-      - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-Salesforce/SFR-Embedding-Mistral}
-      - DB_PROVIDER=postgres
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_NAME=cognee_db
-      - DB_USERNAME=${POSTGRES_USER:-cognee_user}
-      - DB_PASSWORD=${POSTGRES_PASSWORD:-cognee_pass}
-      - VECTOR_DB_PROVIDER=lancedb
-      - GRAPH_DATABASE_PROVIDER=neo4j
-      - GRAPH_DATABASE_URL=bolt://neo4j:7687
-      - GRAPH_DATABASE_USERNAME=${NEO4J_USER:-neo4j}
-      - GRAPH_DATABASE_PASSWORD=${NEO4J_PASSWORD:-neo4j_pass}
-      - ENABLE_BACKEND_ACCESS_CONTROL=False
-      - ACCEPT_LOCAL_FILE_PATH=True
-      - REQUIRE_AUTHENTICATION=False
-    volumes:
-      - cognee_data:/root/.cognee_system
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-
-volumes:
-  pgdata:
-  cognee_data:
-  neo4j_data:
-
-networks:
-  default:
-    name: cognee_mcp_net
-```
-
-### Step 2 — Start
-
-```bash
-docker compose -f docker-compose.mcp-only.yml up -d
-```
-
-### Step 3 — Verify
-
-```bash
-curl http://localhost:8001/health
-# {"status":"ok"}
-```
-
-The MCP server is now accessible at **`http://<your-host-ip>:8001`** from any agent on your network.
-
-### Step 4 — Connect a remote agent
-
-```bash
-# From another machine on the same network
-MCP_URL=http://192.168.1.x:8001 python agent_chat.py
-```
-
-Or set in the agent's env:
-```env
-MCP_URL=http://192.168.1.x:8001
-MCP_HOST_HEADER=localhost:8001
+# Swagger UI
+open http://localhost:8000/api/docs
 ```
 
 ---
 
 ## Interactive Agent UI
 
-A browser-based chat + document cognify interface powered by Groq (llama-4-scout):
+Browser-based chat + document cognify interface (requires `GROQ_API_KEY`):
 
 ```bash
-# requires GROQ_API_KEY in .env
 python agent_server.py
 # open http://localhost:8080
 ```
 
 | Panel | Function |
 |-------|----------|
-| Left — Chat | Talk to the Llama-4 agent; tool calls shown as pills in real-time |
-| Right — Cognify Document | Paste any text/document and store it in the Neo4j graph |
+| Left — Chat | Talk to the agent; tool calls shown as pills in real-time |
+| Right — Cognify Document | Paste any text and store it in the Neo4j graph |
 
 ---
 
-## Direct MCP Agent (CLI)
+## Neo4j Browser
 
-Cognifies `bpi_france_events.json` directly against the MCP server — no FastAPI layer:
+Explore the knowledge graph visually:
 
-```bash
-python test_agent_mcp.py
-# or against a remote MCP:
-MCP_URL=http://192.168.1.x:8001 python test_agent_mcp.py
+```
+http://localhost:7474
+Login: neo4j / neo4j_pass   (or whatever NEO4J_PASSWORD is set to)
+```
+
+Useful Cypher queries:
+```cypher
+// All entities and relationships
+MATCH (a)-[r]->(b) RETURN a,r,b LIMIT 100
+
+// Temporal Event nodes (after memify)
+MATCH (e:Event) RETURN e ORDER BY e.timestamp DESC LIMIT 20
 ```
 
 ---
@@ -314,34 +274,63 @@ MCP_URL=http://192.168.1.x:8001 python test_agent_mcp.py
 pytest tests/test_stack_integration.py -v
 
 # against a remote host
-BASE_URL=http://<host>:8000 MCP_URL=http://<host>:8001 pytest tests/test_stack_integration.py -v
+BASE_URL=http://<host>:8000 MCP_URL=http://<host>:8002 pytest tests/test_stack_integration.py -v
 ```
 
----
-
-## Neo4j Browser
-
-Explore the knowledge graph visually:
-
-```
-http://localhost:7474
-Login: neo4j / neo4j_pass
+Streaming smoke test:
+```bash
+python scripts/test_streaming.py
 ```
 
 ---
 
 ## Switching LLM Backends
 
-Edit `.env`, then:
+### Local Ollama
 
 ```bash
-# If embedding dimensions changed (e.g. 768→1536), wipe the vector store first
-docker compose down
-docker volume rm cognee-layer_cognee_data
+ollama pull qwen2.5
+ollama pull nomic-embed-text
+```
 
-# Restart with new config
+```env
+LLM_PROVIDER=ollama
+LLM_MODEL=qwen2.5:latest
+LLM_ENDPOINT=http://host.docker.internal:11434/v1
+LLM_API_KEY=ollama
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embeddings
+EMBEDDING_DIMENSIONS=768
+HUGGINGFACE_TOKENIZER=Salesforce/SFR-Embedding-Mistral
+```
+
+If embedding dimensions changed (e.g. 1536→768), wipe the vector store first:
+
+```bash
+docker compose down
+docker volume rm cognee-layer_cognee_data cognee-layer_cognee_storage
 docker compose up -d
 ```
+
+---
+
+## MCP Wrapper Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_WRAPPER_PORT` | `8002` | Port the wrapper listens on |
+| `MCP_WRAPPER_LOG_LEVEL` | `INFO` | Log level |
+| `MCP_WRAPPER_API_KEY` | _(empty)_ | API key guard — empty = no auth |
+| `MCP_WRAPPER_STRICT_SESSIONS` | `false` | Reject tool calls without a valid session |
+| `MCP_WRAPPER_SESSION_TTL` | `3600` | Session eviction TTL (seconds) |
+| `MCP_WRAPPER_STREAMING` | `false` | Incremental SSE streaming |
+| `MCP_WRAPPER_RECONNECT_DELAY` | `5` | Initial reconnect delay (seconds) |
+| `MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS` | `10` | Max reconnect attempts |
+| `CIRCUIT_BREAKER_THRESHOLD` | `3` | Failures before circuit opens |
+| `CIRCUIT_BREAKER_TIMEOUT` | `60` | Seconds circuit stays open |
+| `COGNEE_CONTAINER_NAME` | `cognee_mcp_server` | Container name for docker exec tools |
+| `GRAPH_OUTPUT_PATH` | `/graph/cognee_graph.html` | Graph HTML output path |
 
 ---
 
@@ -349,10 +338,13 @@ docker compose up -d
 
 | Symptom | Fix |
 |---------|-----|
-| `421 Invalid Host header` | Add `Host: localhost:8001` to all MCP requests |
+| `{"detail":"Not Found"}` on `/tools` or `/health` | Container running old image — run `docker compose build mcp-wrapper && docker compose up -d mcp-wrapper` |
+| `421 Invalid Host header` on direct MCP calls | Use the MCP Wrapper (:8002) instead of hitting Cognee MCP (:8001) directly |
+| `circuit_breaker_open: true` in `/health` | Cognee MCP is unreachable — check `docker compose logs cognee-mcp` |
+| `Unknown or expired session` | Call `initialize` first and include `mcp-session-id` header on all subsequent requests |
 | `DatabaseNotCreatedError` after prune | Wait ~10s after first `cognify` call; DB setup is async |
-| `ContentTypeError 404` on embeddings | Set `EMBEDDING_ENDPOINT` to include the full path: `.../api/embeddings` |
-| `IngestionError: Local files are not accepted` | Set `ACCEPT_LOCAL_FILE_PATH=True` |
+| `ContentTypeError 404` on embeddings | Set `EMBEDDING_ENDPOINT` to include the full path (e.g. `.../api/embeddings` for Ollama) |
+| `IngestionError: Local files are not accepted` | Set `ACCEPT_LOCAL_FILE_PATH=True` in `.env` |
 | `IntegrityError: duplicate key "data_pkey"` | Harmless — same content hashes to same UUID; pipeline continues |
-| `GeminiException` / wrong provider | Check `LLM_PROVIDER` in container: `docker exec cognee_mcp_server env \| grep LLM` |
-| Embedding dimension mismatch | Wipe `cognee_data` volume and restart |
+| Embedding dimension mismatch after LLM switch | Wipe `cognee_data` and `cognee_storage` volumes and restart |
+| Graph HTML not updated after `visualize_graph` | Both `mcp-wrapper` and `web` mount the `graph_output` volume at `/graph` |

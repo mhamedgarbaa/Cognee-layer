@@ -16,10 +16,11 @@ class JsonFormatter(logging.Formatter):
         # Include exception if present
         if record.exc_info:
             log_record["exception"] = self.formatException(record.exc_info)
-        # Include extra attributes if present (like request_id)
-        if hasattr(record, "request_id"):
-            log_record["request_id"] = record.request_id
-        return json.dumps(log_record)
+        # Forward known `extra=` fields passed by callers
+        for key in ("request_id", "tool", "session_id", "latency_ms", "error"):
+            if hasattr(record, key):
+                log_record[key] = getattr(record, key)
+        return json.dumps(log_record, ensure_ascii=False)
 
 
 # Logging configuration dictionary

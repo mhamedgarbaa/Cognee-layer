@@ -153,6 +153,51 @@ services:
       start_period: 60s
 
   # ============================================
+  # MCP Wrapper — unified tool gateway (port 8002)
+  # Exposes all 10 tools to external MCP-compatible agents.
+  # Mounts Docker socket (read-only) to run memify/visualize
+  # inside cognee-mcp via `docker exec`.
+  # ============================================
+  mcp-wrapper:
+    build:
+      context: .
+      dockerfile: Dockerfile.wrapper
+    container_name: mcp_wrapper
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    networks:
+      - cognee_net
+    depends_on:
+      cognee-mcp:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scripts:/scripts:ro
+      - graph_output:/graph
+    environment:
+      MCP_SERVER_URL: "http://cognee-mcp:8000"
+      MCP_HOST_HEADER: "localhost:8001"
+      MCP_WRAPPER_PORT: "8002"
+      MCP_WRAPPER_LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      MCP_WRAPPER_API_KEY: "${MCP_WRAPPER_API_KEY:-}"
+      MCP_WRAPPER_STRICT_SESSIONS: "${MCP_WRAPPER_STRICT_SESSIONS:-false}"
+      MCP_WRAPPER_SESSION_TTL: "${MCP_WRAPPER_SESSION_TTL:-3600}"
+      MCP_WRAPPER_RECONNECT_DELAY: "5"
+      MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS: "10"
+      COGNEE_CONTAINER_NAME: "cognee_mcp_server"
+      GRAPH_OUTPUT_PATH: "/graph/cognee_graph.html"
+      CIRCUIT_BREAKER_THRESHOLD: "3"
+      CIRCUIT_BREAKER_TIMEOUT: "60"
+      MCP_WRAPPER_STREAMING: "${MCP_WRAPPER_STREAMING:-false}"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ============================================
   # FastAPI Agent Service
   # ============================================
   web:
@@ -186,6 +231,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./:/app
+      - graph_output:/graph
     command: [
       "uvicorn",
       "app:app",
@@ -212,6 +258,8 @@ volumes:
   neo4j_logs:
     driver: local
   neo4j_plugins:
+    driver: local
+  graph_output:
     driver: local
 
 networks:

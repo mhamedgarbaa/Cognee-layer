@@ -1,197 +1,168 @@
-# Cognee Memory System - Implementation Summary
+# Cognee Memory System — Implementation Summary
 
-## ✅ What's Complete
+## Stack Overview (v3.0 — MCP Wrapper)
 
-### 1. **3-Layer Architecture** (Data → Service → API)
-- ✅ Data Layer: `data/repositories/cognee_repository.py`
-- ✅ Service Layer: `service/memory_service.py` with circuit breaker pattern
-- ✅ API Layer: `api/routers/v1/memory_router.py`
-- ✅ Dependency Injection: `api/dependencies.py`
+Five Docker services, all healthy:
 
-### 2. **Memory Subsystem**
-- ✅ Record interactions (fast append to STM)
-- ✅ Trigger cognify (promote to LTM with temporal graph)
-- ✅ Recall context (search with 3-tier fallback degradation)
-- ✅ Circuit breaker pattern (GRAPH_COMPLETION → CHUNKS → NONE_FAILED)
+| Service | Container | Port | Role |
+|---------|-----------|------|------|
+| `db` | `workspace_db` | 5432 | PostgreSQL — app DB + Cognee relational store |
+| `neo4j` | `workspace_neo4j` | 7474 / 7687 | Neo4j 5 — knowledge graph |
+| `cognee-mcp` | `cognee_mcp_server` | 8001 | Cognee MCP — core memory engine |
+| `mcp-wrapper` | `mcp_wrapper` | 8002 | MCP Wrapper — unified tool gateway |
+| `web` | `workspace_api` | 8000 | FastAPI — agent-facing HTTP API |
 
-### 3. **Docker Infrastructure**
-- ✅ PostgreSQL database (workspace storage)
-- ✅ Cognee MCP service (knowledge management)
-- ✅ FastAPI application (agent API)
-- ✅ Proper networking with `cognee_net` bridge
-- ✅ Health checks for all services
-- ✅ Extra hosts for `host.docker.internal` access
-
-### 4. **Testing Framework**
-- ✅ MockEnterpriseAgent class for system testing
-- ✅ MockDataGenerator with 25+ realistic enterprise scenarios
-- ✅ 6-phase end-to-end test suite:
-  - Phase 1: Health check
-  - Phase 2: Recording onboarding data
-  - Phase 3: Context recall
-  - Phase 4: Growth/achievement recording
-  - Phase 5: Knowledge assessment
-  - Phase 6: Multi-user isolation
-
-### 5. **Configuration**
-- ✅ Clean `.env` file with all required variables
-- ✅ Updated `docker-compose.yml` following working patterns
-- ✅ Settings management with Pydantic
-- ✅ Proper environment variable organization
-
-### 6. **Documentation**
-- ✅ ARCHITECTURE_REPORT.md - 14-section comprehensive architecture
-- ✅ DATA_FLOW_ARCHITECTURE.md - Complete data flow documentation
-- ✅ agents/README.md - Quick start and usage guide
-- ✅ COGNEE_MCP_HOST_HEADER_ISSUE.md - Known issues and solutions
-
-## 🔴 Known Issue: Cognee MCP Host Header Validation
-
-### Status
-- Cognee MCP rejects requests with HTTP 421 (Misdirected Request)
-- Reason: Host header validation in Uvicorn/Starlette middleware
-- Current behavior: **System gracefully degrades** (circuit breaker working!)
-- Test result: All phases show PASSED (because degradation is working)
-
-### Evidence
+Startup dependency order:
 ```
-Incoming request: POST /api/v1/memory/record
-HTTP Request: POST http://cognee-mcp:8000/mcp
-Response: HTTP/1.1 421 Misdirected Request
-Error: Invalid Host header: cognee-mcp:8000
+db (healthy) ──┐
+               ├──► cognee-mcp (healthy) ──► mcp-wrapper ──► web
+neo4j (healthy)┘
 ```
 
-### Workaround Options
+---
 
-**Option A: Update docker-compose image tag** (Simplest)
-```yaml
-cognee-mcp:
-  image: cognee/cognee-mcp:0.4.x  # Try older version
+## What's Complete
+
+### Phase 0 — Logging Foundation
+- `configuration/logging_setup.py` extended: `JsonFormatter` forwards MCP-specific extra fields (`request_id`, `tool`, `session_id`, `latency_ms`, `error`) into structured JSON logs.
+
+### Phase 1 — Session Management
+- `mcp-session-id` UUID generated on `initialize`, returned as response header.
+- Sessions stored in `_sessions` dict: `{session_id: {agent_id, created_at}}`.
+- `_validate_session()` rejects `tools/list` and `tools/call` without a valid session.
+- Background eviction loop clears sessions older than `SESSION_TTL_SECONDS` (default 3600s).
+
+### Phase 2 — Tool Dispatch Layer
+- `dispatch(tool_name, args, session_id, user)` routes all 10 tools.
+- **Proxy tools** (8): `cognify`, `save_interaction`, `search`, `list_data`, `cognify_status`, `prune`, `persist_sessions`, `improve_answer` — forwarded via `CogneeMCPProxy.call()`.
+- **Subprocess tools** (2): `memify`, `visualize_graph` — executed via `docker exec` inside `cognee_mcp_server`.
+
+### Phase 3 — Health Endpoint
+- `GET /health` returns: `status`, `tools`, `uptime_seconds`, `active_sessions`, `cognee_mcp_connected`, `circuit_breaker_open`, `consecutive_failures`.
+
+### Phase 4 — Resilient Proxy (`CogneeMCPProxy`)
+- Lazy connect on first call; transparent reconnect on failure.
+- **Circuit breaker**: opens after `CIRCUIT_BREAKER_THRESHOLD` (default 3) consecutive failures, stays open for `CIRCUIT_BREAKER_TIMEOUT` (default 60s).
+- **Exponential backoff**: delays double from `MCP_WRAPPER_RECONNECT_DELAY` (default 5s) up to 60s cap, up to `MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS` (default 10) attempts.
+- Double-checked locking in `ensure_connected()` prevents thundering herd.
+- Startup: quick 5s connect attempt; if unreachable, continues to serve and retries on first call.
+
+### Phase 5 — Skipped (authentication deferred)
+
+### Phase 6 — SSE Streaming
+- `MCP_WRAPPER_STREAMING=true` enables incremental SSE forwarding via `stream_call()`.
+- Subprocess tools (`memify`, `visualize_graph`) emit periodic `notifications/progress` heartbeat pings while the blocking subprocess runs in a thread pool executor.
+- Default (`false`): buffers full result, emits single SSE event — compatible with all clients.
+- `mcp-session-id` correctly propagated in `StreamingResponse` headers.
+
+### Phase 7 — Tool Documentation Endpoint
+- `GET /tools` returns all 10 tools enriched with `category` (`read`/`write`/`admin`) and `typical_latency_seconds`.
+- Includes server metadata and step-by-step session handshake instructions.
+- No authentication required (informational).
+
+---
+
+## Files Added / Modified
+
+| File | Change |
+|------|--------|
+| `mcp_wrapper.py` | New — 800+ line MCP wrapper (Phases 0–7) |
+| `Dockerfile.wrapper` | New — `python:3.11-slim`, copies wrapper + configuration/ |
+| `requirements-wrapper.txt` | New — `fastapi`, `uvicorn`, `httpx`, `python-dotenv` |
+| `docker-compose.yml` | Added `mcp-wrapper` service + `graph_output` volume on `web` |
+| `configuration/logging_setup.py` | Extended `JsonFormatter` for MCP extra fields |
+| `agent_server.py` | Replaced hardcoded Windows paths with env vars |
+| `scripts/visualize_neo4j_graph.py` | Rewrote to use direct Neo4j Cypher (fixes isolated nodes) |
+| `scripts/test_streaming.py` | New — smoke test for streaming mode |
+| `.env.example` | Documented all new MCP wrapper env vars |
+
+---
+
+## 10 Exposed Tools
+
+| Tool | Category | Typical Latency |
+|------|----------|----------------|
+| `cognify` | write | 30s |
+| `save_interaction` | write | 2s |
+| `search` | read | 5s |
+| `list_data` | read | 2s |
+| `cognify_status` | read | 1s |
+| `prune` | admin | 5s |
+| `memify` | write | 120s |
+| `visualize_graph` | read | 15s |
+| `persist_sessions` | write | 10s |
+| `improve_answer` | write | 10s |
+
+---
+
+## Resolved Issues
+
+| Issue | Resolution |
+|-------|------------|
+| `421 Invalid Host header` | `MCP_HOST_HEADER=localhost:8001` env var sent on all proxy requests |
+| Graph isolated nodes | Replaced `get_graph_data()` with direct Cypher `MATCH (a)-[r]->(b)` |
+| `mcp-session-id` dropped on SSE | Pass `headers=` at `StreamingResponse(...)` construction |
+| Startup blocking uvicorn | Quick `asyncio.wait_for(connect, timeout=5)` instead of full retry loop |
+| `MCP_WRAPPER_STREAMING` not in container | Added to `docker-compose.yml` environment block |
+| Windows CMD curl multiline | Replaced with Python test scripts |
+
+---
+
+## Endpoint Reference
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | POST | MCP JSON-RPC endpoint (initialize / tools/list / tools/call) |
+| `/health` | GET | Wrapper health + circuit breaker state |
+| `/tools` | GET | All 10 tools with metadata + session handshake guide |
+
+---
+
+## Key Environment Variables
+
+```env
+# MCP Wrapper
+MCP_WRAPPER_PORT=8002
+MCP_WRAPPER_LOG_LEVEL=INFO
+MCP_WRAPPER_API_KEY=                        # empty = no auth
+MCP_WRAPPER_STRICT_SESSIONS=false
+MCP_WRAPPER_SESSION_TTL=3600
+MCP_WRAPPER_STREAMING=false
+MCP_WRAPPER_RECONNECT_DELAY=5
+MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS=10
+
+# Circuit breaker
+CIRCUIT_BREAKER_THRESHOLD=3
+CIRCUIT_BREAKER_TIMEOUT=60
+
+# Docker exec tools
+COGNEE_CONTAINER_NAME=cognee_mcp_server
+GRAPH_OUTPUT_PATH=/graph/cognee_graph.html
 ```
 
-**Option B: Use external port via host.docker.internal**
-```yaml
-environment:
-  MCP_SERVER_URL: "http://host.docker.internal:8001"
-```
-Update `.env`:
-```
-MCP_SERVER_URL=http://host.docker.internal:8001
-```
+---
 
-**Option C: Use Cognee Backend API instead**
-- Alternative service: `cognee/cognee-backend:main`
-- May not have Host header validation
-
-## 🎯 How to Verify Everything Works
-
-### 1. Start Services
-```bash
-cd "cognee-layer"
-docker-compose up -d
-sleep 15
-```
-
-### 2. Run Test Suite
-```bash
-python -m agents.test_enterprise_scenario
-```
-
-### 3. Check FastAPI Docs
-```
-http://localhost:8000/api/docs
-```
-
-### 4. Verify Docker Services
-```bash
-docker-compose ps
-# Expected: All services healthy or running
-```
-
-## 📊 Test Results Interpretation
-
-When you see:
-```
-[FAIL] Failed to record: Employee John started onboarding...
-[DEGRADED] Query: What is John's role...
-Method: NONE_FAILED
-[OK] ALL TESTS PASSED!
-```
-
-**This is CORRECT** - it shows:
-- ✅ API is reachable
-- ✅ Circuit breaker is working
-- ✅ Graceful degradation is functioning
-- 🔴 Cognee MCP Host header validation is blocking writes
-
-## 🔧 Next Steps to Fix Host Header Issue
-
-### 1. Identify Cognee MCP Version
-Check what your working project uses:
-```bash
-# In the other project
-docker inspect cognee-mcp | grep Image
-```
-
-### 2. Update docker-compose.yml
-Replace image with matching version:
-```yaml
-cognee-mcp:
-  image: cognee/cognee-mcp:0.4.x  # Replace with correct version
-```
-
-### 3. Rebuild and Test
-```bash
-docker-compose down -v
-docker-compose build --no-cache
-docker-compose up -d
-sleep 15
-python -m agents.test_enterprise_scenario
-```
-
-## 📁 Project Structure
+## Project Structure (current)
 
 ```
 cognee-layer/
 ├── app.py                          # FastAPI entry point
-├── docker-compose.yml              # Container orchestration
-├── .env                            # Configuration
-├── requirements.txt                # Python dependencies
-├── agents/                         # Testing framework
-│   ├── mock_enterprise_agent.py
-│   ├── mock_data_generator.py
-│   ├── test_enterprise_scenario.py
-│   └── README.md
-├── api/                            # API Layer
-│   ├── routers/v1/memory_router.py
-│   ├── schemas/memory_schema.py
-│   └── dependencies.py
-├── service/                        # Service Layer (Business Logic)
-│   ├── memory_service.py          # Circuit breaker pattern
-│   └── business_models.py
-├── data/                           # Data Layer
-│   └── repositories/cognee_repository.py
-├── configuration/                  # Settings Management
-│   └── settings.py
-└── docs/                           # Documentation
-    ├── ARCHITECTURE_REPORT.md
-    ├── DATA_FLOW_ARCHITECTURE.md
-    └── COGNEE_MCP_HOST_HEADER_ISSUE.md
+├── agent_server.py                 # Browser-based agent UI (port 8080)
+├── mcp_wrapper.py                  # MCP Wrapper — unified tool gateway
+├── docker-compose.yml              # 5-service stack
+├── Dockerfile                      # FastAPI web service
+├── Dockerfile.wrapper              # MCP Wrapper service
+├── requirements.txt
+├── requirements-wrapper.txt
+├── .env / .env.example
+├── api/                            # FastAPI routers + schemas
+├── service/                        # Business logic + circuit breaker
+├── data/                           # CogneeRepository
+├── configuration/                  # Settings + JsonFormatter
+├── scripts/
+│   ├── postgres-init/              # DB provisioning on first boot
+│   ├── visualize_neo4j_graph.py    # Direct Cypher graph renderer
+│   └── test_streaming.py           # SSE streaming smoke test
+├── ontologies/                     # RDF/OWL ontology files
+└── tests/                          # Integration tests
 ```
-
-## ✨ Key Features
-
-- **Fault Tolerance**: Circuit breaker with 3-level degradation
-- **Async**: Full async/await support
-- **Multi-tenant**: User ID isolation throughout
-- **Fire-and-forget**: 202 Accepted for async writes
-- **Enterprise-ready**: Health checks, logging, error handling
-- **Well-tested**: Comprehensive test suite with mock data
-- **Documented**: Architecture, data flows, and usage guides
-
-## 📝 Summary
-
-Your Cognee memory subsystem is **architecturally sound and fully implemented**. The Host header issue is a **version compatibility problem with Cognee MCP**, not a code issue. The circuit breaker is already protecting your system by gracefully degrading when the primary service fails.
-
-**Recommended next step**: Update Cognee MCP image version to match your working project, which will resolve the Host header validation issue.
-

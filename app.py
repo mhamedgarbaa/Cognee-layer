@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.middlewares.logging_middleware import LoggingMiddleware, RequestIDMiddleware
 from api.routers.v1.workspace_router import router as workspaces_v1_router
@@ -51,6 +52,13 @@ def create_app() -> FastAPI:
         memory_router,
         prefix=f"{settings.API_PREFIX}/v1",
     )
+
+    # Serve knowledge graph HTML from the shared graph_output volume.
+    # After calling visualize_graph, open: http://localhost:8000/graph/cognee_graph.html
+    import os as _os
+    _graph_dir = _os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html").rsplit("/", 1)[0]
+    if _os.path.isdir(_graph_dir):
+        app.mount("/graph", StaticFiles(directory=_graph_dir), name="graph")
 
     # Exception handler
     @app.exception_handler(RequestValidationError)

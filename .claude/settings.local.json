@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker cp *)",
+      "Bash(docker exec cognee_mcp_server bash -c 'python3 -c \" *)"
+    ]
+  }
+}
