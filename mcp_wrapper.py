@@ -277,6 +277,19 @@ class CogneeMCPProxy:
         )
         resp.raise_for_status()
         self._session_id = resp.headers.get("mcp-session-id")
+
+        # MCP 2024-11-05 requires notifications/initialized after initialize
+        # before any tools/call will be accepted (Cognee 0.5.x enforces this).
+        notif = await self._http.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            headers=self._mcp_headers(with_session=True),
+        )
+        # 200 or 202 accepted; anything else is unexpected but non-fatal
+        if notif.status_code not in (200, 202, 204):
+            log.warning("notifications/initialized returned %d", notif.status_code,
+                        extra={"tool": "proxy"})
+
         self._connected = True
         self._cb_record_success()
         log.info("Cognee MCP connected", extra={"session_id": self._session_id, "tool": "proxy"})
@@ -392,8 +405,17 @@ class CogneeMCPProxy:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, COGNEE_RETRY_MAX_DELAY)
                     continue
-                if status in (401, 403, 404):
+                if status in (400, 401, 403, 404):
                     self._connected = False
+                    if status == 400 and attempt < COGNEE_RETRY_MAX_ATTEMPTS:
+                        log.warning(
+                            "400 Bad Request (stale session?) — reconnecting (attempt %d/%d)",
+                            attempt, COGNEE_RETRY_MAX_ATTEMPTS,
+                            extra={"tool": tool},
+                        )
+                        await self.ensure_connected()
+                        last_exc = exc
+                        continue
                 self._cb_record_failure()
                 latency = round((time.monotonic() - t0) * 1000)
                 log.error("cognee_call HTTP error",

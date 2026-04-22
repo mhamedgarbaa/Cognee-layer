@@ -139,7 +139,6 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "data": {"type": "string", "description": "The content to store and process."},
-                    "temporal": {"type": "boolean"},
                 },
                 "required": ["data"],
             },

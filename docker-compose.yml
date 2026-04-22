@@ -94,13 +94,10 @@ services:
 
       # --- LLM (Ollama / OpenAI / Azure / compatible providers via env) ---
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
-      - LLM_MODEL=${LLM_MODEL:-azure/kimi-K2.5}
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-5-nano}
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_ENDPOINT=${LLM_ENDPOINT}
-      # --- Fallback LLM — used automatically when primary hits rate limits ---
-      - FALLBACK_MODEL=${FALLBACK_MODEL}
-      - FALLBACK_API_KEY=${FALLBACK_API_KEY}
-      - FALLBACK_ENDPOINT=${FALLBACK_ENDPOINT}
+      
 
       # --- Embeddings (Ollama / OpenAI via env) ---------------------
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
@@ -108,6 +105,7 @@ services:
       - EMBEDDING_ENDPOINT=${EMBEDDING_ENDPOINT:-http://host.docker.internal:11434/api/embeddings}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-ollama}
       - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-768}
+      
       # Cognee uses this tokenizer only for token counting when EMBEDDING_DIMENSIONS is set
       - HUGGINGFACE_TOKENIZER=${HUGGINGFACE_TOKENIZER:-Salesforce/SFR-Embedding-Mistral}
 
