@@ -148,6 +148,7 @@ services:
       - cognee_storage:/app/.venv/lib/python3.12/site-packages/cognee/.data_storage
       - ./ontologies:/ontologies:ro
       - ./data/data_bpi:/data/bpi:ro
+      - graph_output:/graph
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s

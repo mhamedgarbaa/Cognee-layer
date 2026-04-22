@@ -636,41 +636,42 @@ asyncio.run(run())
 
 
 async def run_visualization() -> str:
-    """Run the visualization script directly in this container (Neo4j reachable on Docker network).
-
-    /scripts is mounted read-only; output is written to GRAPH_OUTPUT_PATH on the shared volume.
-    """
+    """Render the knowledge graph using Cognee's built-in visualize_graph() via docker exec."""
     loop = asyncio.get_event_loop()
 
     def _exec() -> str:
-        import runpy, sys as _sys
+        import docker as _docker, tarfile as _tar, io as _io
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
 
-        # Override OUTPUT path so the script writes to the shared volume
-        os.environ.setdefault("GRAPH_DATABASE_URL",      "bolt://neo4j:7687")
-        os.environ.setdefault("GRAPH_DATABASE_USERNAME",  "neo4j")
-        os.environ.setdefault("GRAPH_DATABASE_PASSWORD",  os.getenv("NEO4J_PASSWORD", "neo4j_pass"))
+        script = f"""
+import asyncio, sys
+sys.path.insert(0, '/app/src')
+from cognee.api.v1.visualize import visualize_graph
 
-        script_path = "/scripts/visualize_neo4j_graph.py"
-        if not os.path.exists(script_path):
-            return f"Script not found: {script_path}"
+async def run():
+    await visualize_graph(destination_file_path="{GRAPH_OUTPUT_PATH}")
+    print(f"Graph rendered to {GRAPH_OUTPUT_PATH}")
 
-        # Patch OUTPUT constant and call main() directly.
-        # exec() sets __name__ to the module spec name, not "__main__", so the
-        # "if __name__ == '__main__'" guard would never fire — main() must be
-        # called explicitly after the module is loaded.
-        src = open(script_path).read().replace(
-            'OUTPUT     = "/tmp/cognee_graph.html"',
-            f'OUTPUT     = "{GRAPH_OUTPUT_PATH}"',
+asyncio.run(run())
+"""
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = script.encode()
+            info = _tar.TarInfo(name="run_visualize.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            "python3 /tmp/run_visualize.py",
+            stream=False,
         )
-        globs: dict = {"__name__": "viz", "__file__": script_path}
-        try:
-            exec(compile(src, script_path, "exec"), globs)
-            globs["main"]()          # __name__ != "__main__" so we call it explicitly
-            return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
-        except SystemExit:
-            return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
-        except Exception as e:
-            return f"Visualization error: {e}"
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Visualization error (exit {exit_code}): {text[-400:]}"
+        return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
 
     result = await loop.run_in_executor(None, _exec)
     return result
