@@ -116,7 +116,9 @@ class MCPClient:
         )
         resp.raise_for_status()
         data = self._sse(resp.text)
-        # Extract text content from the MCP result
+        if "error" in data:
+            err = data["error"]
+            raise RuntimeError(f"MCP error [{err.get('code')}]: {err.get('message')}")
         content = data.get("result", {}).get("content", [])
         parts = [
             item.get("text", "") for item in content
@@ -132,11 +134,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "cognify",
-            "description": "Store and deeply process knowledge into the Cognee graph (entity extraction, relationship mapping). Use for facts, documents, or multi-sentence content worth remembering long-term.",
+            "description": "Store and deeply process knowledge into the Cognee graph (entity extraction, relationship mapping). Use for facts, documents, or multi-sentence content worth remembering long-term. Set temporal=true when the content contains dates/times and you want TEMPORAL search to work on it.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "data": {"type": "string", "description": "The content to store and process."},
+                    "temporal": {"type": "boolean"},
                 },
                 "required": ["data"],
             },
@@ -160,11 +163,28 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search the knowledge graph with a natural-language query. Call this before answering any question that might be in memory.",
+            "description": (
+                "Search the knowledge graph. Choose search_type based on the question:\n"
+                "- GRAPH_COMPLETION (default): entity graph traversal + LLM synthesis\n"
+                "- TEMPORAL: time-aware, filters Event nodes by timestamp (use for 'when' questions)\n"
+                "- RAG_COMPLETION: classic vector RAG over document chunks\n"
+                "- CHUNKS: raw text chunk retrieval\n"
+                "- SUMMARIES: retrieve document summaries only\n"
+                "- CYPHER: LLM generates a Cypher query for structured graph questions\n"
+                "- GRAPH_COMPLETION_COT: chain-of-thought multi-round reasoning (complex questions)"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural-language search query."},
+                    "search_type": {
+                        "type": "string",
+                        "enum": [
+                            "GRAPH_COMPLETION", "GRAPH_COMPLETION_COT", "TEMPORAL",
+                            "RAG_COMPLETION", "CHUNKS", "SUMMARIES", "CYPHER",
+                        ],
+                        "default": "GRAPH_COMPLETION",
+                    },
                 },
                 "required": ["query"],
             },
@@ -198,7 +218,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memify",
-            "description": "Enrich stored document chunks with temporal Event nodes (timestamps) via LLM. Enables TEMPORAL search type. Takes 1-3 minutes — only run when the user wants time-aware search.",
+            "description": "Retroactively add temporal Event nodes to an already-ingested dataset by re-running cognify with temporal_cognify=True. Use when data was ingested without temporal=true and the user now wants TEMPORAL search. Takes 1-3 minutes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -254,13 +274,20 @@ async def dispatch(mcp: MCPClient, name: str, args: dict) -> str:
     print(f"\n  [tool: {name}] args={json.dumps(args, ensure_ascii=False)[:120]}")
     try:
         if name == "cognify":
-            result = await mcp.call("cognify", {"data": args["data"], "user": AGENT_USER}, timeout=300)
+            cognify_args = {"data": args["data"]}
+            temporal = args.get("temporal")
+            if temporal is True or str(temporal).lower() == "true":
+                cognify_args["temporal"] = True
+            result = await mcp.call("cognify", cognify_args, timeout=300)
         elif name == "save_interaction":
-            result = await mcp.call("save_interaction", {"data": args["data"], "user": AGENT_USER}, timeout=120)
+            result = await mcp.call("save_interaction", {"data": args["data"]}, timeout=120)
         elif name == "search":
             result = await mcp.call(
                 "search",
-                {"search_query": args["query"], "search_type": "GRAPH_COMPLETION", "user": AGENT_USER},
+                {
+                    "search_query": args["query"],
+                    "search_type": args.get("search_type", "GRAPH_COMPLETION"),
+                },
                 timeout=180,
             )
         elif name == "list_data":

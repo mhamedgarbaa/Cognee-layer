@@ -52,6 +52,10 @@ MCP_WRAPPER_API_KEY         = os.getenv("MCP_WRAPPER_API_KEY", "")
 MCP_WRAPPER_STRICT_SESSIONS = os.getenv("MCP_WRAPPER_STRICT_SESSIONS", "false").lower() == "true"
 MCP_WRAPPER_RECONNECT_DELAY = int(os.getenv("MCP_WRAPPER_RECONNECT_DELAY", "5"))
 MCP_WRAPPER_MAX_RECONNECT   = int(os.getenv("MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS", "10"))
+# Rate-limit retry — when Cognee's upstream LLM returns 429 we back off and retry
+COGNEE_RETRY_MAX_ATTEMPTS   = int(os.getenv("COGNEE_RETRY_MAX_ATTEMPTS", "4"))
+COGNEE_RETRY_BASE_DELAY     = float(os.getenv("COGNEE_RETRY_BASE_DELAY", "5.0"))
+COGNEE_RETRY_MAX_DELAY      = float(os.getenv("COGNEE_RETRY_MAX_DELAY", "60.0"))
 # Container name and output path are env-driven so they work both locally and in Docker Compose
 COGNEE_CONTAINER_NAME       = os.getenv("COGNEE_CONTAINER_NAME", "cognee_mcp_server")
 GRAPH_OUTPUT_PATH           = os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html")
@@ -72,12 +76,12 @@ log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 TOOL_LIST = [
     {
         "name": "cognify",
-        "description": "Deep-process text/knowledge into the graph (entities, relationships, summaries). Use for rich content.",
+        "description": "Deep-process text/knowledge into the graph (entities, relationships, summaries). Use for rich content. Set temporal=true to also extract Event nodes with timestamps, which enables TEMPORAL search.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "data": {"type": "string", "description": "Text or content to store"},
-                "user": {"type": "string", "description": "Tenant/user identifier (optional)"},
+                "temporal": {"type": "boolean", "description": "Extract temporal Event nodes during ingestion (enables TEMPORAL search). Default false.", "default": False},
             },
             "required": ["data"],
         },
@@ -147,8 +151,9 @@ TOOL_LIST = [
     {
         "name": "memify",
         "description": (
-            "Temporal enrichment: reads DocumentChunk nodes, extracts Event nodes with timestamps "
-            "via LLM, writes them to Neo4j. Enables TEMPORAL search. Takes 1-3 minutes."
+            "Re-run cognify with temporal_cognify=True on a dataset to extract Event nodes with "
+            "timestamps. Use when data was ingested without temporal=true and you want to enable "
+            "TEMPORAL search retroactively. Takes 1-3 minutes."
         ),
         "inputSchema": {
             "type": "object",
@@ -302,6 +307,15 @@ class CogneeMCPProxy:
 
     # ── public call interface ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_rate_limit(text: str) -> bool:
+        t = text.lower()
+        return (
+            "rate limit" in t or "ratelimit" in t or "429" in t
+            or "too many requests" in t or "quota exceeded" in t
+            or "tokens per minute" in t or "requests per minute" in t
+        )
+
     async def call(self, tool: str, args: dict, timeout: float = 180) -> str:
         if self._cb_open():
             raise RuntimeError(
@@ -311,50 +325,86 @@ class CogneeMCPProxy:
 
         await self.ensure_connected()
 
-        t0 = time.monotonic()
-        try:
-            async with self._lock:
-                resp = await self._http.post(
-                    "/mcp",
-                    json={
-                        "jsonrpc": "2.0", "id": self._next_id(), "method": "tools/call",
-                        "params": {"name": tool, "arguments": args},
-                    },
-                    headers=self._mcp_headers(with_session=True),
-                    timeout=timeout,
-                )
-            resp.raise_for_status()
-            data = self._parse_sse(resp.text)
-            content = data.get("result", {}).get("content", [])
-            parts = [
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            ]
-            result = "\n".join(parts) or json.dumps(data.get("result", {}))
-            latency = round((time.monotonic() - t0) * 1000)
-            self._cb_record_success()
-            log.info("cognee_call ok", extra={"tool": tool, "latency_ms": latency})
-            return result
+        delay = COGNEE_RETRY_BASE_DELAY
+        last_exc: Exception | None = None
 
-        except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            # upstream went away — mark disconnected and let the caller surface the error
-            self._connected = False
-            self._cb_record_failure()
-            latency = round((time.monotonic() - t0) * 1000)
-            log.error("cognee_call failed (connection lost)",
-                      extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
-            raise
+        for attempt in range(1, COGNEE_RETRY_MAX_ATTEMPTS + 1):
+            t0 = time.monotonic()
+            try:
+                async with self._lock:
+                    resp = await self._http.post(
+                        "/mcp",
+                        json={
+                            "jsonrpc": "2.0", "id": self._next_id(), "method": "tools/call",
+                            "params": {"name": tool, "arguments": args},
+                        },
+                        headers=self._mcp_headers(with_session=True),
+                        timeout=timeout,
+                    )
+                resp.raise_for_status()
+                data = self._parse_sse(resp.text)
 
-        except httpx.HTTPStatusError as exc:
-            # 4xx/5xx — if session was invalidated, force reconnect next time
-            if exc.response.status_code in (401, 403, 404):
+                if "error" in data:
+                    err     = data["error"]
+                    code    = err.get("code", 0)
+                    message = err.get("message", "")
+                    if self._is_rate_limit(message) and attempt < COGNEE_RETRY_MAX_ATTEMPTS:
+                        log.warning(
+                            "rate limit in MCP error (attempt %d/%d) — retrying in %.0fs: %s",
+                            attempt, COGNEE_RETRY_MAX_ATTEMPTS, delay, message,
+                            extra={"tool": tool},
+                        )
+                        last_exc = RuntimeError(f"MCP error [{code}]: {message}")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, COGNEE_RETRY_MAX_DELAY)
+                        continue
+                    raise RuntimeError(f"Cognee MCP error [{code}]: {message}")
+
+                content = data.get("result", {}).get("content", [])
+                parts = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                result = "\n".join(parts) or json.dumps(data.get("result", {}))
+                latency = round((time.monotonic() - t0) * 1000)
+                self._cb_record_success()
+                log.info("cognee_call ok", extra={"tool": tool, "latency_ms": latency})
+                return result
+
+            except (httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 self._connected = False
-            self._cb_record_failure()
-            latency = round((time.monotonic() - t0) * 1000)
-            log.error("cognee_call HTTP error",
-                      extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
-            raise
+                self._cb_record_failure()
+                latency = round((time.monotonic() - t0) * 1000)
+                log.error("cognee_call failed (connection lost)",
+                          extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
+                raise
+
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if (status == 429 or self._is_rate_limit(str(exc))) and attempt < COGNEE_RETRY_MAX_ATTEMPTS:
+                    log.warning(
+                        "rate limit HTTP %d (attempt %d/%d) — retrying in %.0fs",
+                        status, attempt, COGNEE_RETRY_MAX_ATTEMPTS, delay,
+                        extra={"tool": tool},
+                    )
+                    last_exc = exc
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, COGNEE_RETRY_MAX_DELAY)
+                    continue
+                if status in (401, 403, 404):
+                    self._connected = False
+                self._cb_record_failure()
+                latency = round((time.monotonic() - t0) * 1000)
+                log.error("cognee_call HTTP error",
+                          extra={"tool": tool, "latency_ms": latency, "error": str(exc)})
+                raise
+
+        # All retry attempts exhausted
+        self._cb_record_failure()
+        log.error("cognee_call: exhausted %d retries for tool=%s", COGNEE_RETRY_MAX_ATTEMPTS, tool,
+                  extra={"tool": tool})
+        raise last_exc or RuntimeError(f"Tool {tool} failed after {COGNEE_RETRY_MAX_ATTEMPTS} attempts")
 
     async def stream_call(self, tool: str, args: dict, req_id, timeout: float = 180):
         """Forward upstream SSE events as an async generator.
@@ -531,21 +581,14 @@ async def run_memify(dataset: str = "main_dataset") -> str:
         container = client.containers.get(COGNEE_CONTAINER_NAME)
 
         script = """
-import asyncio, os, sys
+import asyncio, sys
 sys.path.insert(0, '/app/src')
 import cognee
 dataset = sys.argv[1] if len(sys.argv) > 1 else 'main_dataset'
 
 async def run():
-    await cognee.cognee_init()
-    from cognee.modules.graph.utils.convert_node_to_event import convert_nodes_to_events
-    from cognee.infrastructure.databases.graph import get_graph_engine
-    graph = await get_graph_engine()
-    nodes, _ = await graph.get_graph_data()
-    chunks = [n for n in nodes if getattr(n, 'type', '') == 'DocumentChunk']
-    print(f'Found {len(chunks)} DocumentChunk nodes')
-    events = await convert_nodes_to_events(chunks)
-    print(f'Extracted {len(events)} Event nodes')
+    await cognee.cognify(datasets=[dataset], temporal_cognify=True)
+    print(f'Temporal enrichment complete for dataset: {dataset}')
 
 asyncio.run(run())
 """
@@ -589,19 +632,18 @@ async def run_visualization() -> str:
         if not os.path.exists(script_path):
             return f"Script not found: {script_path}"
 
-        # Patch OUTPUT constant before exec by injecting via env
-        import importlib.util, types
-        spec = importlib.util.spec_from_file_location("viz", script_path)
-        mod = importlib.util.module_from_spec(spec)
-        # Override the OUTPUT path to write to the shared volume
-        mod.__dict__["__file__"] = script_path
-        # Read source and replace OUTPUT line
+        # Patch OUTPUT constant and call main() directly.
+        # exec() sets __name__ to the module spec name, not "__main__", so the
+        # "if __name__ == '__main__'" guard would never fire — main() must be
+        # called explicitly after the module is loaded.
         src = open(script_path).read().replace(
             'OUTPUT     = "/tmp/cognee_graph.html"',
             f'OUTPUT     = "{GRAPH_OUTPUT_PATH}"',
         )
+        globs: dict = {"__name__": "viz", "__file__": script_path}
         try:
-            exec(compile(src, script_path, "exec"), mod.__dict__)
+            exec(compile(src, script_path, "exec"), globs)
+            globs["main"]()          # __name__ != "__main__" so we call it explicitly
             return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
         except SystemExit:
             return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
@@ -643,17 +685,22 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
 
     try:
         if tool == "cognify":
-            result = await cognee_call("cognify", {"data": args["data"], "user": user}, timeout=300)
+            cognify_args: dict = {"data": args["data"]}
+            if args.get("temporal"):
+                cognify_args["temporal_cognify"] = True
+            result = await cognee_call("cognify", cognify_args, timeout=300)
         elif tool == "save_interaction":
             # Cognee's save_interaction has a bug: it creates a TextDocument with a file
             # path but never writes the file before the pipeline reads it. Routing to
             # cognify uses the working code path with the same interface.
-            result = await cognee_call("cognify", {"data": args["data"], "user": user}, timeout=300)
+            result = await cognee_call("cognify", {"data": args["data"]}, timeout=300)
         elif tool == "search":
+            query = args.get("search_query") or args.get("query", "")
+            if not query:
+                return [{"type": "text", "text": "Error: search_query is required"}]
             result = await cognee_call("search", {
-                "search_query": args.get("search_query", ""),
+                "search_query": query,
                 "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
-                "user": user,
             }, timeout=180)
         elif tool == "list_data":
             result = await cognee_call("list_data", {}, timeout=60)

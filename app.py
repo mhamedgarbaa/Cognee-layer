@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from api.middlewares.logging_middleware import LoggingMiddleware, RequestIDMiddleware
@@ -53,12 +53,26 @@ def create_app() -> FastAPI:
         prefix=f"{settings.API_PREFIX}/v1",
     )
 
-    # Serve knowledge graph HTML from the shared graph_output volume.
-    # After calling visualize_graph, open: http://localhost:8000/graph/cognee_graph.html
+    # Serve knowledge graph HTML with no-cache headers so every refresh
+    # reflects the latest file written by visualize_graph.
     import os as _os
-    _graph_dir = _os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html").rsplit("/", 1)[0]
-    if _os.path.isdir(_graph_dir):
-        app.mount("/graph", StaticFiles(directory=_graph_dir), name="graph")
+    _graph_file = _os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html")
+
+    @app.get("/graph/cognee_graph.html", response_class=FileResponse)
+    async def serve_graph():
+        if not _os.path.isfile(_graph_file):
+            return HTMLResponse(
+                "<h2>No graph yet — ask the agent to run visualize_graph first.</h2>",
+                status_code=404,
+            )
+        return FileResponse(
+            _graph_file,
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
 
     # Exception handler
     @app.exception_handler(RequestValidationError)

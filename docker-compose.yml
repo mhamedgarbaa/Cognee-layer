@@ -97,6 +97,10 @@ services:
       - LLM_MODEL=${LLM_MODEL:-azure/kimi-K2.5}
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_ENDPOINT=${LLM_ENDPOINT}
+      # --- Fallback LLM — used automatically when primary hits rate limits ---
+      - FALLBACK_MODEL=${FALLBACK_MODEL}
+      - FALLBACK_API_KEY=${FALLBACK_API_KEY}
+      - FALLBACK_ENDPOINT=${FALLBACK_ENDPOINT}
 
       # --- Embeddings (Ollama / OpenAI via env) ---------------------
       - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
@@ -145,6 +149,7 @@ services:
       - cognee_data:/app/.venv/lib/python3.12/site-packages/cognee/.cognee_system
       - cognee_storage:/app/.venv/lib/python3.12/site-packages/cognee/.data_storage
       - ./ontologies:/ontologies:ro
+      - ./data/data_bpi:/data/bpi:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
@@ -185,6 +190,9 @@ services:
       MCP_WRAPPER_SESSION_TTL: "${MCP_WRAPPER_SESSION_TTL:-3600}"
       MCP_WRAPPER_RECONNECT_DELAY: "5"
       MCP_WRAPPER_MAX_RECONNECT_ATTEMPTS: "10"
+      COGNEE_RETRY_MAX_ATTEMPTS: "${COGNEE_RETRY_MAX_ATTEMPTS:-4}"
+      COGNEE_RETRY_BASE_DELAY: "${COGNEE_RETRY_BASE_DELAY:-5.0}"
+      COGNEE_RETRY_MAX_DELAY: "${COGNEE_RETRY_MAX_DELAY:-60.0}"
       COGNEE_CONTAINER_NAME: "cognee_mcp_server"
       GRAPH_OUTPUT_PATH: "/graph/cognee_graph.html"
       CIRCUIT_BREAKER_THRESHOLD: "3"

@@ -23,7 +23,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
-from groq import Groq
+from groq import AsyncGroq
 from pydantic import BaseModel
 
 load_dotenv()
@@ -31,8 +31,8 @@ load_dotenv()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-MCP_URL         = os.getenv("MCP_URL", "http://localhost:8001")
-MCP_HOST_HEADER = os.getenv("MCP_HOST_HEADER", "localhost:8001")
+MCP_URL         = os.getenv("MCP_URL", "http://localhost:8002")
+MCP_HOST_HEADER = os.getenv("MCP_HOST_HEADER", "localhost:8002")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL      = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 AGENT_USER      = os.getenv("AGENT_USER", "chat_user")
@@ -130,7 +130,7 @@ class MCPClient:
 # ── app state ─────────────────────────────────────────────────────────────────
 
 mcp = MCPClient()
-groq_client: Groq | None = None
+groq_client: AsyncGroq | None = None
 
 # per-client conversation history keyed by session_id
 sessions: dict[str, list[dict]] = {}
@@ -138,7 +138,7 @@ sessions: dict[str, list[dict]] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global groq_client
-    groq_client = Groq(api_key=GROQ_API_KEY)
+    groq_client = AsyncGroq(api_key=GROQ_API_KEY)
     await mcp.connect()
     print(f"MCP connected  session={mcp.session_id}")
     yield
@@ -436,15 +436,17 @@ async def agent_stream(message: str, session_id: str) -> AsyncGenerator[str, Non
     def sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-    # agentic loop — keep going until no more tool calls
-    while True:
-        response = groq_client.chat.completions.create(
+    # agentic loop — keep going until no more tool calls (max 8 rounds)
+    MAX_ROUNDS = 8
+    for _round in range(MAX_ROUNDS):
+        response = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.3,
             max_tokens=2048,
+            timeout=60,
         )
 
         msg = response.choices[0].message
@@ -485,7 +487,10 @@ async def agent_stream(message: str, session_id: str) -> AsyncGenerator[str, Non
         answer = msg.content or ""
         history.append({"role": "assistant", "content": answer})
         yield sse("answer", {"text": answer})
-        break
+        return
+
+    # exhausted MAX_ROUNDS without a plain-text answer
+    yield sse("answer", {"text": "I ran into a loop and could not produce a final answer. Please try rephrasing your question."})
 
 
 @app.post("/api/chat")
