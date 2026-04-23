@@ -307,3 +307,40 @@ DocumentChunk via `HAS_EVENT` edge.
 | `ImportError: extract_events_and_entities` | Correct name: `extract_events_and_timestamps` |
 | `memify task chain type mismatch` | Replaced with direct Cypher pipeline in `run_memify.py` |
 | `cognee.setup() AttributeError` | Removed — not a public API in Cognee 0.5.2 |
+
+Graphiti-core in Cognee 0.5.2
+graphiti-core is NOT installed — pip show graphiti-core exits with code 1. The code exists but is a dead import at runtime.
+
+What the 3 files do
+File	Role
+build_graph_with_temporal_awareness.py	Takes a list of texts, connects to Neo4j via Graphiti(url, "neo4j", password), adds each as a timestamped episode
+search_graph_with_temporal_awareness.py	Runs graphiti.search(query) then closes the connection
+index_graphiti_objects.py	Pulls Neo4j nodes/edges from Graphiti's schema, transforms them into Cognee DataPoint objects, and indexes them into LanceDB so standard SearchType.* queries also work on Graphiti episodes
+How to enable it
+Graphiti is an optional extra — it needs to be installed separately:
+
+
+# in Dockerfile.wrapper or a custom cognee image
+RUN pip install "cognee[graphiti]"
+# or directly:
+RUN pip install graphiti-core
+Then you can call it from memify or a new tool inside the container:
+
+
+from cognee.tasks.temporal_awareness import (
+    build_graph_with_temporal_awareness,
+    search_graph_with_temporal_awareness,
+)
+
+# ingest texts as timestamped episodes into Neo4j
+graphiti = await build_graph_with_temporal_awareness(["text1...", "text2..."])
+
+# query
+results = await search_graph_with_temporal_awareness(graphiti, "what happened in 2024?")
+vs. the current temporal_cognify=True approach
+temporal_cognify=True	Graphiti
+Storage	Event nodes inside Cognee graph	Separate Graphiti episode schema in Neo4j
+Install	Already works	Needs pip install graphiti-core
+Query	SearchType.TEMPORAL	graphiti.search() or after index_and_transform_graphiti_nodes_and_edges() also SearchType.*
+Best for	Enriching existing chunks	Full episode timeline from scratch
+Do you want to install graphiti-core into the cognee-mcp image and wire it up as a tool?

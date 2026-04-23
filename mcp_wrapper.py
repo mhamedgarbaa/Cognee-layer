@@ -197,6 +197,39 @@ TOOL_LIST = [
             "required": ["question", "wrong_answer", "feedback"],
         },
     },
+    {
+        "name": "graphiti_ingest",
+        "description": (
+            "Ingest documents into the Graphiti temporal episode graph. "
+            "Each text becomes a timestamped episode in Neo4j, tracking how facts evolve "
+            "over time across documents. Use when you need to track fact changes across versions."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "texts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of texts/documents to ingest as timestamped episodes.",
+                },
+            },
+            "required": ["texts"],
+        },
+    },
+    {
+        "name": "graphiti_search",
+        "description": (
+            "Search the Graphiti temporal episode graph for fact evolution and historical changes. "
+            "Best for: 'how did X change over time?', 'what was the status of Y in period Z?'"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language query about fact evolution over time."},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 # ── Cognee MCP proxy ───────────────────────────────────────────────────────────
@@ -701,6 +734,289 @@ async def run_improve_answer(
     return f"Improved answer (stored):\n{improved}"
 
 
+async def run_graphiti_ingest(texts: list[str]) -> str:
+    """Ingest texts and build/update Graphiti temporal graph."""
+    loop = asyncio.get_event_loop()
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io, json as _json
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        payload = _json.dumps(texts)
+
+        # Plain string (not f-string) — avoids triple-quote termination bug.
+        # __PAYLOAD__ is replaced with the JSON-encoded texts at runtime.
+        script_template = """
+import asyncio, json, os
+from datetime import datetime
+from graphiti_core import Graphiti
+from graphiti_core.nodes import EpisodeType
+from graphiti_core.llm_client.openai_client import OpenAIClient, LLMConfig
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+texts = json.loads(__PAYLOAD__)
+
+llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+llm_url = os.getenv("LLM_ENDPOINT", "").rstrip("/") or None
+llm_mdl = os.getenv("LLM_MODEL", "gpt-4o-mini").replace("openai/", "")
+if not llm_key:
+    raise RuntimeError("LLM_API_KEY and OPENAI_API_KEY are both unset")
+
+# Monkey-patch: Azure does not support the Responses API (responses.parse).
+# _create_completion and _create_structured_completion are defined on OpenAIClient
+# (not BaseOpenAIClient), so we patch OpenAIClient directly.
+import graphiti_core.llm_client.openai_client as _gc_oi
+
+async def _patched_create_completion(self, model, messages, temperature, max_tokens,
+                                     response_model=None, reasoning=None, verbosity=None):
+    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+    kw = dict(model=model, messages=messages, response_format={"type": "json_object"})
+    if not is_gpt5 and temperature is not None:
+        kw["temperature"] = temperature
+    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
+    return await self.client.chat.completions.create(**kw)
+
+async def _patched_create_structured_completion(self, model, messages, temperature, max_tokens,
+                                                 response_model=None, reasoning=None, verbosity=None):
+    import json as _json
+    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+    # Inject the Pydantic schema into the prompt so the LLM knows the exact field names.
+    msg_list = list(messages)
+    if response_model is not None:
+        schema = response_model.model_json_schema()
+        schema_str = _json.dumps(schema, indent=2)
+        instruction = (
+            "\\n\\nIMPORTANT: Respond with a JSON object that EXACTLY matches this schema. "
+            "Use only the field names listed in the schema:\\n" + schema_str
+        )
+        if msg_list:
+            last = msg_list[-1]
+            msg_list[-1] = {**last, "content": (last.get("content") or "") + instruction}
+        else:
+            msg_list.append({"role": "user", "content": instruction})
+    kw = dict(model=model, messages=msg_list, response_format={"type": "json_object"})
+    if not is_gpt5 and temperature is not None:
+        kw["temperature"] = temperature
+    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
+    resp = await self.client.chat.completions.create(**kw)
+    content = resp.choices[0].message.content if resp.choices else "{}"
+    usage = resp.usage
+    class _R:
+        output_text = content
+        class _U:
+            input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        _usage = _U()
+    _R.usage = _R._usage
+    return _R()
+
+_gc_oi.OpenAIClient._create_completion = _patched_create_completion
+_gc_oi.OpenAIClient._create_structured_completion = _patched_create_structured_completion
+
+llm_client = OpenAIClient(config=LLMConfig(
+    api_key=llm_key, model=llm_mdl, base_url=llm_url, small_model=llm_mdl,
+))
+
+embed_raw  = os.getenv("EMBEDDING_ENDPOINT", "http://host.docker.internal:11434/api/embeddings")
+if "/api/embeddings" in embed_raw:
+    embed_base = embed_raw.rsplit("/api/embeddings", 1)[0].rstrip("/") + "/v1"
+else:
+    embed_base = embed_raw.rstrip("/")
+embed_mdl  = __EMBED_MODEL__
+embed_key  = os.getenv("EMBEDDING_API_KEY") or ("ollama" if "11434" in embed_base else llm_key)
+
+embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
+    api_key=embed_key, base_url=embed_base, embedding_model=embed_mdl,
+))
+
+db_url  = os.getenv("GRAPH_DATABASE_URL",     "bolt://neo4j:7687")
+db_user = os.getenv("GRAPH_DATABASE_USERNAME", "neo4j")
+db_pass = os.getenv("GRAPH_DATABASE_PASSWORD", "neo4j_pass")
+
+async def run():
+    valid = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
+    if not valid:
+        raise RuntimeError("No non-empty texts provided")
+    g = Graphiti(db_url, db_user, db_pass, llm_client=llm_client, embedder=embedder)
+    await g.build_indices_and_constraints()
+    try:
+        for i, text in enumerate(valid):
+            await g.add_episode(
+                name="episode_" + str(i),
+                episode_body=text,
+                source=EpisodeType.text,
+                source_description="mcp_wrapper",
+                reference_time=datetime.now(),
+                group_id="default",
+            )
+            print("Added: " + text[:80])
+    finally:
+        await g.close()
+    print("Ingested " + str(len(valid)) + " episode(s) into Graphiti graph.")
+
+asyncio.run(run())
+"""
+        _embed_mdl = (os.getenv("GRAPHITI_EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL", "nomic-embed-text")).replace("openai/", "")
+        script = script_template.replace("__PAYLOAD__", repr(payload)).replace("__EMBED_MODEL__", repr(_embed_mdl))
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = script.encode()
+            info = _tar.TarInfo(name="run_graphiti_ingest.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            "python3 /tmp/run_graphiti_ingest.py", stream=False
+        )
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Graphiti ingest error (exit {exit_code}): {text[-400:]}"
+        return text.strip() or f"Ingested {len(texts)} episodes."
+
+    return await loop.run_in_executor(None, _exec)
+
+
+async def run_graphiti_search(query: str) -> str:
+    """Search the Graphiti episode graph for fact evolution."""
+    loop = asyncio.get_event_loop()
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        # Plain string (not f-string) -- avoids triple-quote termination bug.
+        # __QUERY__ is replaced with the repr'd query string at runtime.
+        script_template = """
+import asyncio, os
+from graphiti_core import Graphiti
+from graphiti_core.llm_client.openai_client import OpenAIClient, LLMConfig
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+import sys
+sys.path.insert(0, '/app/src')
+from cognee.tasks.temporal_awareness import search_graph_with_temporal_awareness
+
+query = __QUERY__
+
+llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+llm_url = os.getenv("LLM_ENDPOINT", "").rstrip("/") or None
+llm_mdl = os.getenv("LLM_MODEL", "gpt-4o-mini").replace("openai/", "")
+if not llm_key:
+    raise RuntimeError("LLM_API_KEY and OPENAI_API_KEY are both unset")
+
+# Monkey-patch: Azure does not support the Responses API (responses.parse).
+# _create_completion and _create_structured_completion are defined on OpenAIClient
+# (not BaseOpenAIClient), so we patch OpenAIClient directly.
+import graphiti_core.llm_client.openai_client as _gc_oi
+
+async def _patched_create_completion(self, model, messages, temperature, max_tokens,
+                                     response_model=None, reasoning=None, verbosity=None):
+    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+    kw = dict(model=model, messages=messages, response_format={"type": "json_object"})
+    if not is_gpt5 and temperature is not None:
+        kw["temperature"] = temperature
+    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
+    return await self.client.chat.completions.create(**kw)
+
+async def _patched_create_structured_completion(self, model, messages, temperature, max_tokens,
+                                                 response_model=None, reasoning=None, verbosity=None):
+    import json as _json
+    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
+    msg_list = list(messages)
+    if response_model is not None:
+        schema = response_model.model_json_schema()
+        schema_str = _json.dumps(schema, indent=2)
+        instruction = (
+            "\\n\\nIMPORTANT: Respond with a JSON object that EXACTLY matches this schema. "
+            "Use only the field names listed in the schema:\\n" + schema_str
+        )
+        if msg_list:
+            last = msg_list[-1]
+            msg_list[-1] = {**last, "content": (last.get("content") or "") + instruction}
+        else:
+            msg_list.append({"role": "user", "content": instruction})
+    kw = dict(model=model, messages=msg_list, response_format={"type": "json_object"})
+    if not is_gpt5 and temperature is not None:
+        kw["temperature"] = temperature
+    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
+    resp = await self.client.chat.completions.create(**kw)
+    content = resp.choices[0].message.content if resp.choices else "{}"
+    usage = resp.usage
+    class _R:
+        output_text = content
+        class _U:
+            input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        _usage = _U()
+    _R.usage = _R._usage
+    return _R()
+
+_gc_oi.OpenAIClient._create_completion = _patched_create_completion
+_gc_oi.OpenAIClient._create_structured_completion = _patched_create_structured_completion
+
+llm_client = OpenAIClient(config=LLMConfig(
+    api_key=llm_key, model=llm_mdl, base_url=llm_url, small_model=llm_mdl,
+))
+
+embed_raw  = os.getenv("EMBEDDING_ENDPOINT", "http://host.docker.internal:11434/api/embeddings")
+if "/api/embeddings" in embed_raw:
+    embed_base = embed_raw.rsplit("/api/embeddings", 1)[0].rstrip("/") + "/v1"
+else:
+    embed_base = embed_raw.rstrip("/")
+embed_mdl  = __EMBED_MODEL__
+embed_key  = os.getenv("EMBEDDING_API_KEY") or ("ollama" if "11434" in embed_base else llm_key)
+
+embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
+    api_key=embed_key, base_url=embed_base, embedding_model=embed_mdl,
+))
+
+db_url  = os.getenv("GRAPH_DATABASE_URL",     "bolt://neo4j:7687")
+db_user = os.getenv("GRAPH_DATABASE_USERNAME", "neo4j")
+db_pass = os.getenv("GRAPH_DATABASE_PASSWORD", "neo4j_pass")
+
+async def run():
+    g = Graphiti(db_url, db_user, db_pass, llm_client=llm_client, embedder=embedder)
+    await g.build_indices_and_constraints()
+    try:
+        results = await search_graph_with_temporal_awareness(g, query)
+        if not results:
+            print("No results found.")
+        for item in results:
+            print(item)
+    finally:
+        await g.close()
+
+asyncio.run(run())
+"""
+        _embed_mdl = (os.getenv("GRAPHITI_EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL", "nomic-embed-text")).replace("openai/", "")
+        script = script_template.replace("__QUERY__", repr(query)).replace("__EMBED_MODEL__", repr(_embed_mdl))
+
+
+
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = script.encode()
+            info = _tar.TarInfo(name="run_graphiti_search.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run(
+            "python3 /tmp/run_graphiti_search.py", stream=False
+        )
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Graphiti search error (exit {exit_code}): {text[-400:]}"
+        return text.strip() or "No results found."
+
+    return await loop.run_in_executor(None, _exec)
+
+
 # ── tool dispatcher ────────────────────────────────────────────────────────────
 
 async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGENT_USER) -> str:
@@ -742,6 +1058,18 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
                 args.get("question", ""), args.get("wrong_answer", ""), args.get("feedback", ""),
                 user=user,
             )
+        elif tool == "graphiti_ingest":
+            texts = args.get("texts", [])
+            if not texts:
+                result = "Error: texts list is required and cannot be empty."
+            else:
+                result = await run_graphiti_ingest(texts)
+        elif tool == "graphiti_search":
+            query = args.get("query", "")
+            if not query:
+                result = "Error: query is required."
+            else:
+                result = await run_graphiti_search(query)
         else:
             result = f"Unknown tool: {tool}"
 

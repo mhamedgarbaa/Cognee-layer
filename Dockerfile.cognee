@@ -1,0 +1,14 @@
+FROM cognee/cognee-mcp:main
+
+# Install graphiti-core for temporal episode tracking (fact evolution over time)
+RUN pip install --no-cache-dir --target /app/.venv/lib/python3.12/site-packages graphiti-core
+
+# Register Azure deployment model name variants as tiktoken aliases.
+# text-embedding-3-small uses cl100k_base; Azure appends suffixes like -1.
+# sitecustomize.py runs before any user code so cognee picks it up on startup.
+RUN python3 -c "\
+import site, os; \
+sp = '/app/.venv/lib/python3.12/site-packages'; \
+code = '''try:\n    import tiktoken\n    _extra = [\n        \"text-embedding-3-small-1\",\n        \"openai/text-embedding-3-small-1\",\n        \"text-embedding-3-large-1\",\n    ]\n    for _m in _extra:\n        tiktoken.model.MODEL_TO_ENCODING.setdefault(_m, \"cl100k_base\")\nexcept Exception:\n    pass\n'''; \
+open(os.path.join(sp, 'sitecustomize.py'), 'w').write(code) \
+"

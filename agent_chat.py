@@ -264,6 +264,38 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "graphiti_ingest",
+            "description": "Ingest documents into the Graphiti temporal episode graph to track how facts evolve over time. Each text becomes a timestamped episode in Neo4j. Use for documents where content changes across versions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "texts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of texts/documents to ingest as timestamped episodes.",
+                    },
+                },
+                "required": ["texts"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graphiti_search",
+            "description": "Search the Graphiti temporal episode graph for how facts evolved over time. Best for: 'how did X change?', 'what was the status of Y in period Z?', 'what changed between documents?'",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language query about fact evolution over time."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -307,6 +339,10 @@ async def dispatch(mcp: MCPClient, name: str, args: dict) -> str:
                 "wrong_answer": args["wrong_answer"],
                 "feedback":     args["feedback"],
             }, timeout=120)
+        elif name == "graphiti_ingest":
+            result = await mcp.call("graphiti_ingest", {"texts": args["texts"]}, timeout=300)
+        elif name == "graphiti_search":
+            result = await mcp.call("graphiti_search", {"query": args["query"]}, timeout=120)
         else:
             result = f"Unknown tool: {name}"
         print(f"  [tool: {name}] done — {result[:120].replace(chr(10), ' ')}")

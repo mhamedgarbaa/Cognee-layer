@@ -71,7 +71,9 @@ services:
   # Now fully plug-and-play: OpenAI + Postgres + Neo4j
   # ============================================
   cognee-mcp:
-    image: cognee/cognee-mcp:main
+    build:
+      context: .
+      dockerfile: Dockerfile.cognee
     container_name: cognee_mcp_server
     restart: unless-stopped
     ports:
@@ -97,6 +99,9 @@ services:
       - LLM_MODEL=${LLM_MODEL:-openai/gpt-5-nano}
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_ENDPOINT=${LLM_ENDPOINT}
+      # Graphiti internals may read OpenAI-compatible env names directly.
+      - OPENAI_API_KEY=${LLM_API_KEY}
+      - OPENAI_BASE_URL=${LLM_ENDPOINT}
       
 
       # --- Embeddings (Ollama / OpenAI via env) ---------------------
@@ -197,6 +202,18 @@ services:
       CIRCUIT_BREAKER_THRESHOLD: "3"
       CIRCUIT_BREAKER_TIMEOUT: "60"
       MCP_WRAPPER_STREAMING: "${MCP_WRAPPER_STREAMING:-false}"
+      # --- LLM + Embedding credentials (used when building Graphiti scripts) ---
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
+      LLM_ENDPOINT: "${LLM_ENDPOINT}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-embed-text}"
+      EMBEDDING_ENDPOINT: "${EMBEDDING_ENDPOINT}"
+      EMBEDDING_API_KEY: "${EMBEDDING_API_KEY}"
+      GRAPHITI_EMBEDDING_MODEL: "${GRAPHITI_EMBEDDING_MODEL:-}"
+      # --- Graph DB (Graphiti connects directly to Neo4j) ---
+      GRAPH_DATABASE_URL: "bolt://neo4j:7687"
+      GRAPH_DATABASE_USERNAME: "${NEO4J_USER:-neo4j}"
+      GRAPH_DATABASE_PASSWORD: "${NEO4J_PASSWORD:-neo4j_pass}"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
       interval: 30s
