@@ -1,0 +1,10 @@
+{
+  "Supplier-policy.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Supplier-policy.pdf"
+  },
+  "Annual Report 2023 EPIC Bpifrance.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Annual Report 2023 EPIC Bpifrance.pdf"
+  }
+}

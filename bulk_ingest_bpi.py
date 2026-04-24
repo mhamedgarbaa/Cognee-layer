@@ -154,11 +154,10 @@ async def main():
 
             container_path = f"{CONTAINER_DATA_DIR}/{safe_name}"
 
-            await wait_idle(http, session_id)
-
             print(f"  Cognifying ...", end=" ", flush=True)
             try:
                 result = await mcp_call(http, session_id, "cognify", {"data": container_path})
+                await wait_idle(http, session_id)
                 print(f"OK — {result[:80]}")
                 # ✅ Mark as ingested ONLY on success — prevents partial ingest
                 # entries from being skipped on the next run.
