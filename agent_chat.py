@@ -217,7 +217,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memify",
-            "description": "Retroactively add temporal Event nodes to an already-ingested dataset by re-running cognify with temporal_cognify=True. Use when data was ingested without temporal=true and the user now wants TEMPORAL search. Takes 1-3 minutes.",
+            "description": "Enrich an existing knowledge graph by creating triplet embeddings (Entity → Relationship → Entity). Enables SearchType.TRIPLET_COMPLETION queries. Run after cognify on a dataset. Takes 5-10 minutes.",
             "parameters": {
                 "type": "object",
                 "properties": {

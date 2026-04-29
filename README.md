@@ -9,7 +9,7 @@ Drop it into any agent stack and get persistent semantic memory via the
 ## Architecture
 
 ```
-External Agents / Claude / LangChain
+External Agents / LangChain
           │
           │ HTTP JSON-RPC 2.0
           ▼

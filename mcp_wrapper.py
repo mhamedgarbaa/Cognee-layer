@@ -151,9 +151,8 @@ TOOL_LIST = [
     {
         "name": "memify",
         "description": (
-            "Re-run cognify with temporal_cognify=True on a dataset to extract Event nodes with "
-            "timestamps. Use when data was ingested without temporal=true and you want to enable "
-            "TEMPORAL search retroactively. Takes 1-3 minutes."
+            "Enrich an existing knowledge graph by creating triplet embeddings (Entity → Relationship → Entity). "
+            "Enables SearchType.TRIPLET_COMPLETION queries. Run after cognify on a dataset. Takes 5-10 minutes."
         ),
         "inputSchema": {
             "type": "object",
@@ -638,12 +637,14 @@ async def run_memify(dataset: str = "main_dataset") -> str:
         script = """
 import asyncio, sys
 sys.path.insert(0, '/app/src')
-import cognee
+from cognee.memify_pipelines.create_triplet_embeddings import create_triplet_embeddings
+from cognee.modules.users.methods import get_default_user
 dataset = sys.argv[1] if len(sys.argv) > 1 else 'main_dataset'
 
 async def run():
-    await cognee.cognify(datasets=[dataset], temporal_cognify=True)
-    print(f'Temporal enrichment complete for dataset: {dataset}')
+    user = await get_default_user()
+    await create_triplet_embeddings(user, dataset)
+    print(f'Triplet embeddings created for dataset: {dataset}')
 
 asyncio.run(run())
 """
@@ -708,6 +709,52 @@ asyncio.run(run())
 
     result = await loop.run_in_executor(None, _exec)
     return result
+
+
+async def run_prune() -> str:
+    """Wipe all cognee data via docker exec.
+
+    Cognee's MCP prune calls prune_data() which does shutil.rmtree on the data
+    directory — that directory is a Docker volume mount point, so it fails with
+    EBUSY. We skip prune_data() and call only:
+      - datasets.delete_all()  → removes graph, vector, and relational data
+      - prune_system(...)      → clears remaining DB state and cache
+    Cognee's own API resolves all paths from its config, no hardcoding needed.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        script = """
+import asyncio, sys
+sys.path.insert(0, '/app/src')
+import cognee
+
+async def main():
+    await cognee.prune.prune_system(graph=True, vector=True, metadata=True, cache=True)
+    print("Prune complete.")
+
+asyncio.run(main())
+"""
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            content = script.encode()
+            info = _tar.TarInfo(name="run_prune.py")
+            info.size = len(content)
+            t.addfile(info, _io.BytesIO(content))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+
+        exit_code, output = container.exec_run("python3 /tmp/run_prune.py", stream=False)
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Prune error (exit {exit_code}): {text[-400:]}"
+        return text.strip() or "Prune complete."
+
+    return await loop.run_in_executor(None, _exec)
 
 
 async def run_persist_sessions(data: str, user: str = AGENT_USER) -> str:
@@ -1024,9 +1071,7 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
 
     try:
         if tool == "cognify":
-            cognify_args: dict = {"data": args["data"]}
-            if args.get("temporal"):
-                cognify_args["temporal_cognify"] = True
+            cognify_args: dict = {"data": args["data"], "temporal_cognify": True}
             result = await cognee_call("cognify", cognify_args, timeout=300)
         elif tool == "save_interaction":
             # Cognee's save_interaction has a bug: it creates a TextDocument with a file
@@ -1046,7 +1091,7 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
         elif tool == "cognify_status":
             result = await cognee_call("cognify_status", {}, timeout=30)
         elif tool == "prune":
-            result = await cognee_call("prune", {}, timeout=60)
+            result = await run_prune()
         elif tool == "memify":
             result = await run_memify(args.get("dataset", "main_dataset"))
         elif tool == "visualize_graph":

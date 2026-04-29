@@ -1,10 +1,42 @@
 {
+  "Annual Report 2023 EPIC Bpifrance.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Annual Report 2023 EPIC Bpifrance.pdf"
+  },
+  "Bpifrance Financement-Amendement URD n1-18 juin 2020_ENGLISH VD.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Bpifrance Financement-Amendement URD n1-18 juin 2020_ENGLISH VD.pdf"
+  },
+  "Bpifrance Responsible Investment Report 2021.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Bpifrance Responsible Investment Report 2021.pdf"
+  },
   "Supplier-policy.pdf": {
     "ingested": true,
     "container_path": "/data/bpi/Supplier-policy.pdf"
   },
-  "Annual Report 2023 EPIC Bpifrance.pdf": {
+  "Bpifrance - Amendment #1 dated 28 April 2023 to the 2022 Universal Registration Document.pdf": {
     "ingested": true,
-    "container_path": "/data/bpi/Annual Report 2023 EPIC Bpifrance.pdf"
+    "container_path": "/data/bpi/Bpifrance - Amendment _1 dated 28 April 2023 to the 2022 Universal Registration Document.pdf"
+  },
+  "Bpifrance_Green Financing Framework_2026.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Bpifrance_Green Financing Framework_2026.pdf"
+  },
+  "Bpifrance Amendment 1 dated 28 April 2023 to the 2022 Universal Registration Document.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Bpifrance Amendment 1 dated 28 April 2023 to the 2022 Universal Registration Document.pdf"
+  },
+  "Recruitment-policy.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Recruitment-policy.pdf"
+  },
+  "Half-year Consolidated Financial Statements 30 June 2022.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Half-year Consolidated Financial Statements 30 June 2022.pdf"
+  },
+  "Half-year Consolidated Financial Statements 30 June 2023.pdf": {
+    "ingested": true,
+    "container_path": "/data/bpi/Half-year Consolidated Financial Statements 30 June 2023.pdf"
   }
 }

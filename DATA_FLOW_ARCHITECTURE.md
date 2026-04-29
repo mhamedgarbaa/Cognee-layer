@@ -66,7 +66,7 @@
 Every agent must complete a handshake before calling tools.
 
 ```
-Agent                          MCP Wrapper (:8002)
+Agent                          MCP pper (:8002)
   │                                   │
   │  POST /mcp                        │
   │  { method: "initialize",          │

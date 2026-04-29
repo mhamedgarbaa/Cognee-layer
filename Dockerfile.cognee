@@ -3,12 +3,15 @@ FROM cognee/cognee-mcp:main
 # Install graphiti-core for temporal episode tracking (fact evolution over time)
 RUN pip install --no-cache-dir --target /app/.venv/lib/python3.12/site-packages graphiti-core
 
-# Register Azure deployment model name variants as tiktoken aliases.
-# text-embedding-3-small uses cl100k_base; Azure appends suffixes like -1.
-# sitecustomize.py runs before any user code so cognee picks it up on startup.
-RUN python3 -c "\
-import site, os; \
-sp = '/app/.venv/lib/python3.12/site-packages'; \
-code = '''try:\n    import tiktoken\n    _extra = [\n        \"text-embedding-3-small-1\",\n        \"openai/text-embedding-3-small-1\",\n        \"text-embedding-3-large-1\",\n    ]\n    for _m in _extra:\n        tiktoken.model.MODEL_TO_ENCODING.setdefault(_m, \"cl100k_base\")\nexcept Exception:\n    pass\n'''; \
-open(os.path.join(sp, 'sitecustomize.py'), 'w').write(code) \
-"
+# sitecustomize.py runs at Python startup before any user code.
+# Fix 1 — tiktoken aliases for Azure deployment model name variants.
+# Fix 2 — replace litellm.aembedding with a direct AsyncOpenAI call so Azure
+#          AI Foundry responses are not routed through the broken legacy parse
+#          path that LiteLLM triggers with X-Stainless-Raw-Response: true.
+COPY patches/sitecustomize.py /app/.venv/lib/python3.12/site-packages/sitecustomize.py
+
+# Patch LiteLLMEmbeddingEngine to call AsyncOpenAI directly instead of
+# litellm.aembedding, bypassing the X-Stainless-Raw-Response header that
+# causes Azure AI Foundry responses to be parsed as a plain string.
+COPY patches/fix_litellm_engine.py /tmp/fix_litellm_engine.py
+RUN python3 /tmp/fix_litellm_engine.py
