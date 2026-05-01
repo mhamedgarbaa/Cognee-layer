@@ -122,6 +122,10 @@ services:
       - DB_USERNAME=${POSTGRES_USER:-workspace_user}
       - DB_PASSWORD=${POSTGRES_PASSWORD:-workspace_pass}
 
+      # --- Memory / Data scaling  -------------------------------------
+      - DATA_ROOT_DIRECTORY=/app/cognee_storage/data
+      - SYSTEM_ROOT_DIRECTORY=/app/cognee_data/system
+
       # --- Vector store: LanceDB (file-backed, kept as-is) -----------
       - VECTOR_DB_PROVIDER=lancedb
 
@@ -149,8 +153,8 @@ services:
       # --- Logging ----------------------------------------------------
       - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
     volumes:
-      - cognee_data:/app/.venv/lib/python3.12/site-packages/cognee/.cognee_system
-      - cognee_storage:/app/.venv/lib/python3.12/site-packages/cognee/.data_storage
+      - cognee_data:/app/cognee_data
+      - cognee_storage:/app/cognee_storage
       - ./ontologies:/ontologies:ro
       - ./data/data_bpi:/data/bpi:ro
       - graph_output:/graph
@@ -183,6 +187,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./scripts:/scripts:ro
+      - ./graph_builder.py:/app/graph_builder.py:ro
       - graph_output:/graph
     environment:
       MCP_SERVER_URL: "http://cognee-mcp:8000"
@@ -257,13 +262,8 @@ services:
     volumes:
       - ./:/app
       - graph_output:/graph
-    command: [
-      "uvicorn",
-      "app:app",
-      "--host", "0.0.0.0",
-      "--port", "8000",
-      "--reload"
-    ]
+    command: >
+      sh -c "chmod -f 777 /graph || true && uvicorn app:app --host 0.0.0.0 --port 8000 --reload"
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s

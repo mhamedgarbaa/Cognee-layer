@@ -59,6 +59,8 @@ COGNEE_RETRY_MAX_DELAY      = float(os.getenv("COGNEE_RETRY_MAX_DELAY", "60.0"))
 # Container name and output path are env-driven so they work both locally and in Docker Compose
 COGNEE_CONTAINER_NAME       = os.getenv("COGNEE_CONTAINER_NAME", "cognee_mcp_server")
 GRAPH_OUTPUT_PATH           = os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html")
+# Web service URL — used by visualize_graph to trigger graph_builder via HTTP
+WEB_SERVICE_URL             = os.getenv("WEB_SERVICE_URL", "http://web:8000")
 # Gate streaming SSE forwarding — off by default so non-streaming clients keep working
 MCP_WRAPPER_STREAMING       = os.getenv("MCP_WRAPPER_STREAMING", "false").lower() == "true"
 # Tools that run a subprocess and need heartbeats instead of upstream SSE forwarding
@@ -163,8 +165,26 @@ TOOL_LIST = [
     },
     {
         "name": "visualize_graph",
-        "description": "Render the full Neo4j knowledge graph as an interactive HTML file at /tmp/cognee_graph.html.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Build an animated, interactive knowledge-graph viewer from Neo4j. "
+            "Fetches all nodes and edges, then generates a self-contained HTML page "
+            "using force-graph (D3 physics) with: "
+            "color-coded node types, animated radar-ping rings on hub nodes, "
+            "particle flow along edges, tooltip with node description on hover, "
+            "a detail panel showing full node properties and description, "
+            "and a live search bar. "
+            "Open http://localhost:8000/graph in your browser when done."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max nodes to include (default 800).",
+                    "default": 800,
+                },
+            },
+        },
     },
     {
         "name": "persist_sessions",
@@ -554,7 +574,9 @@ async def _stream_subprocess(tool_name: str, tool_args: dict, req_id):
             run_memify(tool_args.get("dataset", "main_dataset"))
         )
     else:
-        fn = lambda: asyncio.get_event_loop().run_until_complete(run_visualization())  # noqa: E731
+        fn = lambda: asyncio.get_event_loop().run_until_complete(  # noqa: E731
+            run_visualization(tool_args.get("limit", 800))
+        )
 
     # Run subprocess in a thread so we can yield while it runs
     task = asyncio.ensure_future(
@@ -594,7 +616,7 @@ def _sync_dispatch(tool_name: str, tool_args: dict) -> str:
     try:
         if tool_name == "memify":
             return loop.run_until_complete(run_memify(tool_args.get("dataset", "main_dataset")))
-        return loop.run_until_complete(run_visualization())
+        return loop.run_until_complete(run_visualization(tool_args.get("limit", 800)))
     finally:
         loop.close()
 
@@ -669,46 +691,20 @@ asyncio.run(run())
     return output or "Memify complete."
 
 
-async def run_visualization() -> str:
-    """Render the knowledge graph using Cognee's built-in visualize_graph() via docker exec."""
-    loop = asyncio.get_event_loop()
+async def run_visualization(limit: int = 800) -> str:
+    """
+    Build the knowledge-graph HTML directly using graph_builder.build().
 
-    def _exec() -> str:
-        import docker as _docker, tarfile as _tar, io as _io
-        client = _docker.from_env()
-        container = client.containers.get(COGNEE_CONTAINER_NAME)
-
-        script = f"""
-import asyncio, sys
-sys.path.insert(0, '/app/src')
-from cognee.api.v1.visualize import visualize_graph
-
-async def run():
-    await visualize_graph(destination_file_path="{GRAPH_OUTPUT_PATH}")
-    print(f"Graph rendered to {GRAPH_OUTPUT_PATH}")
-
-asyncio.run(run())
-"""
-        buf = _io.BytesIO()
-        with _tar.open(fileobj=buf, mode="w") as t:
-            content = script.encode()
-            info = _tar.TarInfo(name="run_visualize.py")
-            info.size = len(content)
-            t.addfile(info, _io.BytesIO(content))
-        buf.seek(0)
-        container.put_archive("/tmp", buf.read())
-
-        exit_code, output = container.exec_run(
-            "python3 /tmp/run_visualize.py",
-            stream=False,
-        )
-        text = output.decode(errors="replace") if output else ""
-        if exit_code != 0:
-            return f"Visualization error (exit {exit_code}): {text[-400:]}"
-        return f"Graph rendered → {GRAPH_OUTPUT_PATH}"
-
-    result = await loop.run_in_executor(None, _exec)
-    return result
+    Fetches all nodes/edges from Neo4j, generates an animated force-graph
+    HTML page, and writes it to the shared graph_output volume.
+    The web container's /graph endpoint serves the same file.
+    """
+    from graph_builder import build as _build
+    try:
+        result = await _build(GRAPH_OUTPUT_PATH, limit)
+        return f"{result}\nOpen http://localhost:8000/graph in your browser."
+    except Exception as exc:
+        return f"Graph build failed: {exc}"
 
 
 async def run_prune() -> str:
@@ -1095,7 +1091,7 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
         elif tool == "memify":
             result = await run_memify(args.get("dataset", "main_dataset"))
         elif tool == "visualize_graph":
-            result = await run_visualization()
+            result = await run_visualization(args.get("limit", 5000))
         elif tool == "persist_sessions":
             result = await run_persist_sessions(args.get("data", ""), user=user)
         elif tool == "improve_answer":

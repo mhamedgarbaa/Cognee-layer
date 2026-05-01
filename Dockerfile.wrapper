@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements-wrapper.txt
 
 # Copy only what the wrapper needs
 COPY mcp_wrapper.py .
+COPY graph_builder.py .
 COPY configuration/ ./configuration/
 
 EXPOSE 8002

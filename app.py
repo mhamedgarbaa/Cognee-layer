@@ -1,7 +1,9 @@
+import asyncio
 import os
 import time
 
 from fastapi import FastAPI, Request
+from fastapi.background import BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -86,12 +88,92 @@ def create_app() -> FastAPI:
             "memifiedNodes": s["memified_nodes"],
         }
 
-    # ── Serve knowledge-graph HTML ────────────────────────────────────────────
+    # ── Knowledge graph: live JSON data ──────────────────────────────────────
+    @app.get("/graph/data")
+    async def graph_data(limit: int = 5000):
+        """Return nodes + edges from Neo4j as JSON for the graph viewer."""
+        try:
+            from neo4j import AsyncGraphDatabase
+            driver = AsyncGraphDatabase.driver(_NEO4J_URI, auth=(_NEO4J_USER, _NEO4J_PASS))
+            nodes: dict = {}
+            edges: list = []
+            async with driver.session() as s:
+                res = await s.run(
+                    "MATCH (n) RETURN elementId(n) AS id, labels(n) AS lbls, "
+                    "properties(n) AS props LIMIT $lim",
+                    lim=limit,
+                )
+                async for rec in res:
+                    nid = str(rec["id"])
+                    lbls = rec["lbls"] or []
+                    props = {k: str(v)[:300] for k, v in (rec["props"] or {}).items()}
+                    _internal = {"__Node__", "__Entity__", "__Community__", "__Chunk__"}
+                    node_type = next((l for l in lbls if l not in _internal), lbls[0] if lbls else "Node")
+                    name = (
+                        props.get("name") or props.get("label") or
+                        props.get("title") or node_type
+                    )
+                    nodes[nid] = {
+                        "id": nid, "label": str(name)[:60],
+                        "type": node_type,
+                        "labels": [l for l in lbls if l not in _internal] or lbls,
+                        "properties": props,
+                    }
+                node_ids = set(nodes)
+                res = await s.run(
+                    "MATCH (n)-[r]->(m) RETURN elementId(r) AS eid, elementId(n) AS src, "
+                    "elementId(m) AS tgt, type(r) AS rel LIMIT $lim",
+                    lim=limit * 3,
+                )
+                seen: set = set()
+                async for rec in res:
+                    src, tgt = str(rec["src"]), str(rec["tgt"])
+                    if src in node_ids and tgt in node_ids:
+                        eid = str(rec["eid"])
+                        if eid not in seen:
+                            seen.add(eid)
+                            edges.append({
+                                "id": eid, "source": src,
+                                "target": tgt, "label": rec["rel"] or "",
+                            })
+            await driver.close()
+            return {"nodes": list(nodes.values()), "edges": edges}
+        except Exception as exc:
+            logger.error("graph_data error: %s", exc)
+            return JSONResponse({"error": str(exc), "nodes": [], "edges": []}, status_code=500)
+
+    # ── Knowledge graph: build (fetch Neo4j → NetworkX layout → HTML) ────────
+    @app.post("/graph/build")
+    async def graph_build(background_tasks: BackgroundTasks, limit: int = 5000):
+        """Trigger graph_builder: fetch Neo4j, compute layout, write HTML."""
+        async def _run():
+            try:
+                from graph_builder import build as _build
+                await _build(_GRAPH_FILE, limit)
+                logger.info("graph_builder finished → %s", _GRAPH_FILE)
+            except Exception as exc:
+                logger.error("graph_builder error: %s", exc)
+        background_tasks.add_task(_run)
+        return {
+            "status":   "building",
+            "message":  "Graph is being built. Refresh /graph in a few seconds.",
+            "graph_url": "http://localhost:8000/graph",
+        }
+
+    # ── Serve the graph viewer HTML ───────────────────────────────────────────
+    @app.get("/graph", response_class=HTMLResponse)
     @app.get("/graph/cognee_graph.html", response_class=FileResponse)
     async def serve_graph():
         if not os.path.isfile(_GRAPH_FILE):
             return HTMLResponse(
-                "<h2>No graph yet — run visualize_graph first.</h2>",
+                "<html><body style='background:#0f172a;color:#94a3b8;"
+                "font-family:sans-serif;display:flex;align-items:center;"
+                "justify-content:center;height:100vh;margin:0'>"
+                "<div style='text-align:center'>"
+                "<h2 style='color:#38bdf8'>No graph yet</h2>"
+                "<p>Call the <code>visualize_graph</code> MCP tool first,<br>"
+                "or POST to <code>/graph/build</code>.</p>"
+                "</div></body></html>",
                 status_code=404,
             )
         return FileResponse(
