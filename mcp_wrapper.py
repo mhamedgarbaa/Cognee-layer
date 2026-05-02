@@ -16,7 +16,7 @@ Connect any MCP-compatible agent to:
 
 Tools exposed:
     cognify, save_interaction, search (with search_type), list_data,
-    cognify_status, prune, memify, visualize_graph, persist_sessions, improve_answer
+    cognify_status, prune, memify, persist_sessions, improve_answer
 """
 
 import asyncio
@@ -58,13 +58,10 @@ COGNEE_RETRY_BASE_DELAY     = float(os.getenv("COGNEE_RETRY_BASE_DELAY", "5.0"))
 COGNEE_RETRY_MAX_DELAY      = float(os.getenv("COGNEE_RETRY_MAX_DELAY", "60.0"))
 # Container name and output path are env-driven so they work both locally and in Docker Compose
 COGNEE_CONTAINER_NAME       = os.getenv("COGNEE_CONTAINER_NAME", "cognee_mcp_server")
-GRAPH_OUTPUT_PATH           = os.getenv("GRAPH_OUTPUT_PATH", "/graph/cognee_graph.html")
-# Web service URL — used by visualize_graph to trigger graph_builder via HTTP
-WEB_SERVICE_URL             = os.getenv("WEB_SERVICE_URL", "http://web:8000")
 # Gate streaming SSE forwarding — off by default so non-streaming clients keep working
 MCP_WRAPPER_STREAMING       = os.getenv("MCP_WRAPPER_STREAMING", "false").lower() == "true"
 # Tools that run a subprocess and need heartbeats instead of upstream SSE forwarding
-_SUBPROCESS_TOOLS: frozenset[str] = frozenset({"memify", "visualize_graph"})
+_SUBPROCESS_TOOLS: frozenset[str] = frozenset({"memify"})
 
 # ── JSON logger (shared config from configuration/logging_setup.py) ──────────
 # Importing applies the dictConfig; then we grab a named child logger.
@@ -160,29 +157,6 @@ TOOL_LIST = [
             "type": "object",
             "properties": {
                 "dataset": {"type": "string", "default": "main_dataset"},
-            },
-        },
-    },
-    {
-        "name": "visualize_graph",
-        "description": (
-            "Build an animated, interactive knowledge-graph viewer from Neo4j. "
-            "Fetches all nodes and edges, then generates a self-contained HTML page "
-            "using force-graph (D3 physics) with: "
-            "color-coded node types, animated radar-ping rings on hub nodes, "
-            "particle flow along edges, tooltip with node description on hover, "
-            "a detail panel showing full node properties and description, "
-            "and a live search bar. "
-            "Open http://localhost:8000/graph in your browser when done."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Max nodes to include (default 800).",
-                    "default": 800,
-                },
             },
         },
     },
@@ -568,16 +542,6 @@ async def _stream_subprocess(tool_name: str, tool_args: dict, req_id):
     """
     loop = asyncio.get_event_loop()
 
-    # Dispatch to the right blocking function
-    if tool_name == "memify":
-        fn = lambda: asyncio.get_event_loop().run_until_complete(  # noqa: E731
-            run_memify(tool_args.get("dataset", "main_dataset"))
-        )
-    else:
-        fn = lambda: asyncio.get_event_loop().run_until_complete(  # noqa: E731
-            run_visualization(tool_args.get("limit", 800))
-        )
-
     # Run subprocess in a thread so we can yield while it runs
     task = asyncio.ensure_future(
         loop.run_in_executor(None, _sync_dispatch, tool_name, tool_args)
@@ -614,9 +578,7 @@ def _sync_dispatch(tool_name: str, tool_args: dict) -> str:
     import asyncio as _asyncio
     loop = _asyncio.new_event_loop()
     try:
-        if tool_name == "memify":
-            return loop.run_until_complete(run_memify(tool_args.get("dataset", "main_dataset")))
-        return loop.run_until_complete(run_visualization(tool_args.get("limit", 800)))
+        return loop.run_until_complete(run_memify(tool_args.get("dataset", "main_dataset")))
     finally:
         loop.close()
 
@@ -690,21 +652,6 @@ asyncio.run(run())
     output = await loop.run_in_executor(None, _exec)
     return output or "Memify complete."
 
-
-async def run_visualization(limit: int = 800) -> str:
-    """
-    Build the knowledge-graph HTML directly using graph_builder.build().
-
-    Fetches all nodes/edges from Neo4j, generates an animated force-graph
-    HTML page, and writes it to the shared graph_output volume.
-    The web container's /graph endpoint serves the same file.
-    """
-    from graph_builder import build as _build
-    try:
-        result = await _build(GRAPH_OUTPUT_PATH, limit)
-        return f"{result}\nOpen http://localhost:8000/graph in your browser."
-    except Exception as exc:
-        return f"Graph build failed: {exc}"
 
 
 async def run_prune() -> str:
@@ -1090,8 +1037,6 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
             result = await run_prune()
         elif tool == "memify":
             result = await run_memify(args.get("dataset", "main_dataset"))
-        elif tool == "visualize_graph":
-            result = await run_visualization(args.get("limit", 5000))
         elif tool == "persist_sessions":
             result = await run_persist_sessions(args.get("data", ""), user=user)
         elif tool == "improve_answer":
@@ -1297,7 +1242,6 @@ _TOOL_METADATA: dict[str, dict] = {
     "cognify_status":    {"category": "read",  "typical_latency_seconds": 1},
     "prune":             {"category": "admin", "typical_latency_seconds": 5},
     "memify":            {"category": "write", "typical_latency_seconds": 120},
-    "visualize_graph":   {"category": "read",  "typical_latency_seconds": 15},
     "persist_sessions":  {"category": "write", "typical_latency_seconds": 10},
     "improve_answer":    {"category": "write", "typical_latency_seconds": 10},
 }
