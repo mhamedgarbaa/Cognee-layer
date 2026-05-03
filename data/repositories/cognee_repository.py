@@ -276,6 +276,25 @@ class CogneeRepository:
         })
         return result if isinstance(result, dict) else {"raw": result}
 
+    async def delete_dataset(self, dataset_id: str, mode: str = "soft") -> Dict[str, Any]:
+        """Delete all data items belonging to a dataset.
+
+        Fetches every item in the dataset via list_data, then deletes each one.
+        Returns a summary of how many items were removed.
+        """
+        items = await self.list_data(dataset_id=dataset_id)
+        deleted, failed = 0, 0
+        for item in items:
+            item_id = item.get("id") or item.get("data_id") if isinstance(item, dict) else None
+            if not item_id:
+                continue
+            try:
+                await self.delete_data(data_id=str(item_id), dataset_id=dataset_id, mode=mode)
+                deleted += 1
+            except Exception:
+                failed += 1
+        return {"dataset_id": dataset_id, "deleted": deleted, "failed": failed}
+
     async def prune(self) -> Dict[str, Any]:
         """Permanently delete ALL data from the Cognee knowledge graph."""
         result = await self._call_mcp_tool("prune", {})
@@ -284,4 +303,51 @@ class CogneeRepository:
     async def cognify_status(self) -> Dict[str, Any]:
         """Check the status of the cognify pipeline."""
         result = await self._call_mcp_tool("cognify_status", {})
+        return result if isinstance(result, dict) else {"raw": result}
+
+    # ──────────────────────────────────────────────
+    # Feedback & Trace Operations
+    # ──────────────────────────────────────────────
+
+    async def submit_feedback(
+        self,
+        user_id: str,
+        session_id: str,
+        qa_id: str,
+        feedback_score: int,
+        feedback_text: str | None = None,
+    ) -> Dict[str, Any]:
+        """Submit quality feedback for a previous recall result."""
+        arguments: Dict[str, Any] = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "qa_id": qa_id,
+            "feedback_score": feedback_score,
+        }
+        if feedback_text is not None:
+            arguments["feedback_text"] = feedback_text
+        result = await self._call_mcp_tool("submit_feedback", arguments)
+        return result if isinstance(result, dict) else {"raw": result}
+
+    async def record_trace(
+        self,
+        user_id: str,
+        session_id: str,
+        origin_function: str,
+        status: str = "success",
+        memory_query: str = "",
+        method_params: Dict[str, Any] | None = None,
+        error_message: str = "",
+    ) -> Dict[str, Any]:
+        """Record an agent trace step for observability."""
+        arguments: Dict[str, Any] = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "origin_function": origin_function,
+            "status": status,
+            "memory_query": memory_query,
+            "method_params": method_params or {},
+            "error_message": error_message,
+        }
+        result = await self._call_mcp_tool("record_trace", arguments)
         return result if isinstance(result, dict) else {"raw": result}

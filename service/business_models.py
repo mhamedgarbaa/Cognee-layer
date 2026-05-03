@@ -30,3 +30,16 @@ class CognifyStatus(BaseModel):
     """Domain model wrapping the cognify pipeline status."""
     status: str
     details: Dict[str, Any] = {}
+
+
+class FeedbackResult(BaseModel):
+    """Domain model wrapping a feedback submission result."""
+    status: str
+    qa_id: str
+    feedback_score: int
+
+
+class TraceResult(BaseModel):
+    """Domain model wrapping an agent trace recording result."""
+    status: str
+    trace_id: str | None = None

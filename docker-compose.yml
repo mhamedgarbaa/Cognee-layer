@@ -150,6 +150,21 @@ services:
       - ONTOLOGY_RESOLVER=rdflib
       - MATCHING_STRATEGY=fuzzy
 
+      # --- Rate limiting --------------------------------------------------
+      - LLM_RATE_LIMIT_ENABLED=${LLM_RATE_LIMIT_ENABLED:-true}
+      - LLM_RATE_LIMIT_REQUESTS=${LLM_RATE_LIMIT_REQUESTS:-60}
+      - LLM_RATE_LIMIT_INTERVAL=${LLM_RATE_LIMIT_INTERVAL:-60}
+      - EMBEDDING_RATE_LIMIT_ENABLED=${EMBEDDING_RATE_LIMIT_ENABLED:-true}
+      - EMBEDDING_RATE_LIMIT_REQUESTS=${EMBEDDING_RATE_LIMIT_REQUESTS:-60}
+      - EMBEDDING_RATE_LIMIT_INTERVAL=${EMBEDDING_RATE_LIMIT_INTERVAL:-60}
+
+      # --- Session caching (filesystem — sufficient for CEO/admin brain) -
+      - CACHING=true
+      - CACHE_BACKEND=fs
+      - SESSION_TTL_SECONDS=86400
+      - CACHE_ROOT_DIRECTORY=/app/cognee_data/cache
+      - COGNEE_LOG_SEARCH_HISTORY=true
+
       # --- Logging ----------------------------------------------------
       - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
     volumes:

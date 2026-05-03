@@ -182,6 +182,21 @@ def create_app() -> FastAPI:
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
 
+    # ── Ontology helpers ──────────────────────────────────────────────────────
+    import httpx as _httpx
+
+    async def _reload_cognee_ontology() -> None:
+        """Tell mcp-wrapper to restart cognee-mcp so it picks up the new ontology file."""
+        try:
+            async with _httpx.AsyncClient(base_url=_MCP_WRAPPER_URL, timeout=90) as c:
+                resp = await c.post("/admin/reload-cognee")
+                if resp.status_code != 200:
+                    logger.warning("Cognee reload returned %s: %s", resp.status_code, resp.text[:200])
+                else:
+                    logger.info("Cognee MCP restarted — new ontology active")
+        except Exception as exc:
+            logger.warning("Failed to reload cognee-mcp after ontology update: %s", exc)
+
     # ── Ontology info ─────────────────────────────────────────────────────────
     @app.get("/ontology/info")
     async def ontology_info():
@@ -214,6 +229,7 @@ def create_app() -> FastAPI:
         dest = pathlib.Path(ONTOLOGY_DIR) / "ontology.ttl"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(raw)
+        await _reload_cognee_ontology()
         return {
             "path":     f"/ontologies/{dest.name}",
             "filename": file.filename,
@@ -231,6 +247,7 @@ def create_app() -> FastAPI:
         dest = pathlib.Path(ONTOLOGY_DIR) / "ontology.ttl"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
+        await _reload_cognee_ontology()
         return {
             "path": "/ontologies/ontology.ttl",
             "size": len(content.encode("utf-8")),

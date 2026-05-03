@@ -5,7 +5,7 @@ Architecture:
   Other agents  ──►  POST http://localhost:8002/mcp  (this file)
                           │
                           ├── base tools  ──►  Cognee MCP  http://localhost:8001
-                          └── custom tools ──► local logic (memify, visualize, etc.)
+                          └── custom tools ──► local logic (memify, etc.)
 
 Run:
     python mcp_wrapper.py
@@ -16,7 +16,8 @@ Connect any MCP-compatible agent to:
 
 Tools exposed:
     cognify, save_interaction, search (with search_type), list_data,
-    cognify_status, prune, memify, persist_sessions, improve_answer
+    cognify_status, prune, memify, improve, persist_sessions, improve_answer,
+    create_dataset, switch_dataset, delete_dataset
 """
 
 import asyncio
@@ -103,14 +104,17 @@ TOOL_LIST = [
             "Search the knowledge graph. search_type controls the strategy:\n"
             "GRAPH_COMPLETION (default) — entity graph + LLM synthesis\n"
             "GRAPH_COMPLETION_COT — chain-of-thought multi-round reasoning\n"
+            "GRAPH_COMPLETION_DECOMPOSITION — decomposes complex queries into sub-queries\n"
             "GRAPH_COMPLETION_CONTEXT_EXTENSION — expands context with follow-up queries\n"
             "GRAPH_SUMMARY_COMPLETION — includes document summaries\n"
-            "TEMPORAL — time-aware, filters Event nodes by timestamp\n"
+            "TEMPORAL — time-aware, filters Event nodes by timestamp (use for 'last month', 'in Q2')\n"
+            "TRIPLET_COMPLETION — fast subject-predicate-object search (requires memify first)\n"
             "CYPHER — LLM-generated Cypher query\n"
             "NATURAL_LANGUAGE — NL → graph query auto-translation\n"
             "RAG_COMPLETION — classic vector RAG\n"
             "SUMMARIES — document summaries only\n"
-            "CHUNKS — raw text chunks\n"
+            "CHUNKS — raw text chunks by vector similarity\n"
+            "CHUNKS_LEXICAL — keyword/BM25 search (use for codes, acronyms, exact terms)\n"
             "FEELING_LUCKY — auto-selects best type"
         ),
         "inputSchema": {
@@ -121,9 +125,11 @@ TOOL_LIST = [
                     "type": "string",
                     "enum": [
                         "GRAPH_COMPLETION", "GRAPH_COMPLETION_COT",
+                        "GRAPH_COMPLETION_DECOMPOSITION",
                         "GRAPH_COMPLETION_CONTEXT_EXTENSION", "GRAPH_SUMMARY_COMPLETION",
-                        "TEMPORAL", "CYPHER", "NATURAL_LANGUAGE",
-                        "RAG_COMPLETION", "SUMMARIES", "CHUNKS", "FEELING_LUCKY",
+                        "TEMPORAL", "TRIPLET_COMPLETION", "CYPHER", "NATURAL_LANGUAGE",
+                        "RAG_COMPLETION", "SUMMARIES", "CHUNKS", "CHUNKS_LEXICAL",
+                        "FEELING_LUCKY",
                     ],
                     "default": "GRAPH_COMPLETION",
                 },
@@ -161,10 +167,109 @@ TOOL_LIST = [
         },
     },
     {
+        "name": "improve",
+        "description": (
+            "Promote session memory to the permanent knowledge graph and enrich it. "
+            "Runs 4 stages: (1) apply feedback weights from session Q&A ratings, "
+            "(2) persist session question/answer pairs into the graph, "
+            "(3) persist agent trace steps, "
+            "(4) sync enriched graph back into session caches for fast recall. "
+            "Call this after a CEO/admin session ends or on a nightly schedule. "
+            "Pass session_ids to bridge specific sessions; omit to run enrichment only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset_name": {
+                    "type": "string",
+                    "default": "main_dataset",
+                    "description": "Dataset to enrich",
+                },
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Session IDs to bridge into permanent graph. Omit to run enrichment only.",
+                },
+            },
+        },
+    },
+    {
+        "name": "forget_memory",
+        "description": (
+            "Delete memory from the enterprise brain. "
+            "Pass dataset name to delete a specific dataset, or everything=true to wipe all user data."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset":    {"type": "string", "description": "Dataset name to delete"},
+                "everything": {"type": "boolean", "default": False, "description": "Wipe all user memory"},
+            },
+        },
+    },
+    {
+        "name": "delete",
+        "description": (
+            "Delete a specific data item by ID. "
+            "mode=soft marks it deleted (recoverable); mode=hard permanently removes it from the graph."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_id":    {"type": "string", "description": "UUID of the data item to delete"},
+                "dataset_id": {"type": "string", "description": "UUID of the dataset containing the item"},
+                "mode":       {"type": "string", "enum": ["soft", "hard"], "default": "soft"},
+            },
+            "required": ["data_id"],
+        },
+    },
+    {
+        "name": "submit_feedback",
+        "description": (
+            "Score a past recall result so the enterprise brain learns from CEO/admin corrections. "
+            "Attach a 1–5 rating (and optional text) to a qa_id returned by a previous recall. "
+            "Scores are applied to graph node weights by improve() — higher-rated answers boost "
+            "their source nodes, lower-rated ones decrease them."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "qa_id":          {"type": "string", "description": "QA entry ID from a recall result"},
+                "session_id":     {"type": "string", "description": "Session ID that produced the recall"},
+                "feedback_score": {"type": "integer", "minimum": 1, "maximum": 5,
+                                   "description": "Quality score 1 (wrong) – 5 (perfect)"},
+                "feedback_text":  {"type": "string", "description": "Optional free-text correction"},
+                "user_id":        {"type": "string", "description": "User who is rating"},
+            },
+            "required": ["qa_id", "feedback_score"],
+        },
+    },
+    {
+        "name": "record_trace",
+        "description": (
+            "Log an agent tool-call step to the session trace so improve() can later "
+            "persist it into the permanent knowledge graph. "
+            "Call this after each tool invocation to build an auditable decision trail."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "origin_function": {"type": "string", "description": "Tool or function name that was called"},
+                "status":          {"type": "string", "enum": ["success", "error"], "default": "success"},
+                "session_id":      {"type": "string", "description": "Current session ID"},
+                "user_id":         {"type": "string", "description": "User performing the action"},
+                "memory_query":    {"type": "string", "default": "", "description": "Query sent to memory, if any"},
+                "method_params":   {"type": "object", "description": "Tool arguments (will be stored)"},
+                "error_message":   {"type": "string", "default": "", "description": "Error detail if status=error"},
+            },
+            "required": ["origin_function"],
+        },
+    },
+    {
         "name": "persist_sessions",
         "description": (
-            "Self-improvement: store recent agent conversation sessions as knowledge graph nodes. "
-            "Pass the session transcript as 'data'. Future searches will include this context."
+            "Legacy fallback: store a raw conversation transcript as a graph node via cognify. "
+            "Prefer 'improve' with session_ids for proper session bridging with feedback weights."
         ),
         "inputSchema": {
             "type": "object",
@@ -191,36 +296,42 @@ TOOL_LIST = [
         },
     },
     {
-        "name": "graphiti_ingest",
+        "name": "create_dataset",
         "description": (
-            "Ingest documents into the Graphiti temporal episode graph. "
-            "Each text becomes a timestamped episode in Neo4j, tracking how facts evolve "
-            "over time across documents. Use when you need to track fact changes across versions."
+            "Create a named dataset and set it as the active dataset for this session. "
+            "All subsequent cognify and search calls will target this dataset."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "texts": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of texts/documents to ingest as timestamped episodes.",
-                },
+                "dataset_name": {"type": "string", "description": "Name for the new dataset"},
             },
-            "required": ["texts"],
+            "required": ["dataset_name"],
         },
     },
     {
-        "name": "graphiti_search",
+        "name": "switch_dataset",
         "description": (
-            "Search the Graphiti temporal episode graph for fact evolution and historical changes. "
-            "Best for: 'how did X change over time?', 'what was the status of Y in period Z?'"
+            "Switch the active dataset for this session without creating a new one. "
+            "Future cognify and search calls will target this dataset."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural language query about fact evolution over time."},
+                "dataset_name": {"type": "string", "description": "Name of the existing dataset to switch to"},
             },
-            "required": ["query"],
+            "required": ["dataset_name"],
+        },
+    },
+    {
+        "name": "delete_dataset",
+        "description": "Delete a named dataset and all its stored knowledge. Irreversible — only call when explicitly asked.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataset_name": {"type": "string", "description": "Name of the dataset to delete"},
+            },
+            "required": ["dataset_name"],
         },
     },
 ]
@@ -536,7 +647,7 @@ async def cognee_call(tool: str, args: dict, timeout: float = 180) -> str:
 async def _stream_subprocess(tool_name: str, tool_args: dict, req_id):
     """Run a subprocess tool in an executor and yield SSE heartbeats while it runs.
 
-    Subprocess tools (memify, visualize_graph) produce no intermediate output,
+    Subprocess tools (memify) produce no intermediate output,
     so we send MCP notifications/progress pings every 5 s to keep the connection
     alive, then emit the final JSON-RPC result event.
     """
@@ -599,7 +710,9 @@ async def stream_tool_result(tool_name: str, tool_args: dict, req_id, session_id
     # Determine timeout by tool
     _TIMEOUTS = {
         "cognify": 300, "save_interaction": 120, "search": 180,
-        "persist_sessions": 300, "improve_answer": 180,
+        "forget_memory": 60, "delete": 60,
+        "submit_feedback": 30, "record_trace": 30,
+        "improve": 600, "persist_sessions": 300, "improve_answer": 180,
     }
     timeout = _TIMEOUTS.get(tool_name, 60)
 
@@ -700,6 +813,116 @@ asyncio.run(main())
     return await loop.run_in_executor(None, _exec)
 
 
+async def run_submit_feedback(
+    user_id: str,
+    session_id: str,
+    qa_id: str,
+    feedback_score: int | None,
+    feedback_text: str | None,
+) -> str:
+    loop = asyncio.get_event_loop()
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io, json as _json
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        script = f"""
+import asyncio, sys
+sys.path.insert(0, '/app/src')
+from cognee.infrastructure.databases.cache.get_cache_engine import get_cache_engine
+
+async def main():
+    cache = get_cache_engine()
+    if cache is None:
+        print("ERROR: cache engine unavailable — set CACHING=true")
+        return
+    ok = await cache.update_qa_entry(
+        user_id={_json.dumps(user_id)},
+        session_id={_json.dumps(session_id)},
+        qa_id={_json.dumps(qa_id)},
+        feedback_score={feedback_score!r},
+        feedback_text={_json.dumps(feedback_text) if feedback_text else "None"},
+    )
+    print("submitted" if ok else "qa_id_not_found")
+
+asyncio.run(main())
+"""
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            data = script.encode()
+            info = _tar.TarInfo(name="run_feedback.py")
+            info.size = len(data)
+            t.addfile(info, _io.BytesIO(data))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+        exit_code, output = container.exec_run("python3 /tmp/run_feedback.py", stream=False)
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Feedback error (exit {exit_code}): {text[-300:]}"
+        return text.strip() or "Feedback submitted."
+
+    return await loop.run_in_executor(None, _exec)
+
+
+async def run_record_trace(
+    user_id: str,
+    session_id: str,
+    origin_function: str,
+    status: str,
+    memory_query: str,
+    method_params: dict,
+    error_message: str,
+) -> str:
+    loop = asyncio.get_event_loop()
+
+    def _exec() -> str:
+        import docker as _docker, tarfile as _tar, io as _io, json as _json
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+
+        script = f"""
+import asyncio, sys, uuid
+sys.path.insert(0, '/app/src')
+from cognee.infrastructure.databases.cache.get_cache_engine import get_cache_engine
+
+async def main():
+    cache = get_cache_engine()
+    if cache is None:
+        print("ERROR: cache engine unavailable — set CACHING=true")
+        return
+    trace_id = str(uuid.uuid4())
+    await cache.append_agent_trace_step(
+        user_id={_json.dumps(user_id)},
+        session_id={_json.dumps(session_id)},
+        trace_id=trace_id,
+        origin_function={_json.dumps(origin_function)},
+        status={_json.dumps(status)},
+        memory_query={_json.dumps(memory_query)},
+        method_params={_json.dumps(method_params)},
+        error_message={_json.dumps(error_message)},
+    )
+    print(f"trace:{{trace_id}}")
+
+asyncio.run(main())
+"""
+        buf = _io.BytesIO()
+        with _tar.open(fileobj=buf, mode="w") as t:
+            data = script.encode()
+            info = _tar.TarInfo(name="run_trace.py")
+            info.size = len(data)
+            t.addfile(info, _io.BytesIO(data))
+        buf.seek(0)
+        container.put_archive("/tmp", buf.read())
+        exit_code, output = container.exec_run("python3 /tmp/run_trace.py", stream=False)
+        text = output.decode(errors="replace") if output else ""
+        if exit_code != 0:
+            return f"Trace error (exit {exit_code}): {text[-300:]}"
+        return text.strip() or "Trace recorded."
+
+    return await loop.run_in_executor(None, _exec)
+
+
 async def run_persist_sessions(data: str, user: str = AGENT_USER) -> str:
     if not data.strip():
         return "No session data provided."
@@ -724,153 +947,37 @@ async def run_improve_answer(
     return f"Improved answer (stored):\n{improved}"
 
 
-async def run_graphiti_ingest(texts: list[str]) -> str:
-    """Ingest texts and build/update Graphiti temporal graph."""
-    loop = asyncio.get_event_loop()
-
-    def _exec() -> str:
-        import docker as _docker, tarfile as _tar, io as _io, json as _json
-        client = _docker.from_env()
-        container = client.containers.get(COGNEE_CONTAINER_NAME)
-
-        payload = _json.dumps(texts)
-
-        # Plain string (not f-string) — avoids triple-quote termination bug.
-        # __PAYLOAD__ is replaced with the JSON-encoded texts at runtime.
-        script_template = """
-import asyncio, json, os
-from datetime import datetime
-from graphiti_core import Graphiti
-from graphiti_core.nodes import EpisodeType
-from graphiti_core.llm_client.openai_client import OpenAIClient, LLMConfig
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-
-texts = json.loads(__PAYLOAD__)
-
-llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-llm_url = os.getenv("LLM_ENDPOINT", "").rstrip("/") or None
-llm_mdl = os.getenv("LLM_MODEL", "gpt-4o-mini").replace("openai/", "")
-if not llm_key:
-    raise RuntimeError("LLM_API_KEY and OPENAI_API_KEY are both unset")
-
-# Monkey-patch: Azure does not support the Responses API (responses.parse).
-# _create_completion and _create_structured_completion are defined on OpenAIClient
-# (not BaseOpenAIClient), so we patch OpenAIClient directly.
-import graphiti_core.llm_client.openai_client as _gc_oi
-
-async def _patched_create_completion(self, model, messages, temperature, max_tokens,
-                                     response_model=None, reasoning=None, verbosity=None):
-    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
-    kw = dict(model=model, messages=messages, response_format={"type": "json_object"})
-    if not is_gpt5 and temperature is not None:
-        kw["temperature"] = temperature
-    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
-    return await self.client.chat.completions.create(**kw)
-
-async def _patched_create_structured_completion(self, model, messages, temperature, max_tokens,
-                                                 response_model=None, reasoning=None, verbosity=None):
-    import json as _json
-    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
-    # Inject the Pydantic schema into the prompt so the LLM knows the exact field names.
-    msg_list = list(messages)
-    if response_model is not None:
-        schema = response_model.model_json_schema()
-        schema_str = _json.dumps(schema, indent=2)
-        instruction = (
-            "\\n\\nIMPORTANT: Respond with a JSON object that EXACTLY matches this schema. "
-            "Use only the field names listed in the schema:\\n" + schema_str
+async def run_create_dataset(dataset_name: str, session_id: str) -> str:
+    """Activate a named dataset for the session — Cognee creates it on first cognify call."""
+    clean = dataset_name.strip()
+    if not clean:
+        return "Error: dataset_name cannot be empty."
+    if session_id and session_id in _sessions:
+        _sessions[session_id]["dataset_name"] = clean
+        agent = _sessions[session_id]["agent_id"]
+        log.info("dataset activated", extra={"session_id": session_id, "dataset": clean, "tool": "create_dataset"})
+        return (
+            f"Dataset '{clean}' is now active for session '{agent}'. "
+            "Cognee will create it on the first cognify call targeting this session."
         )
-        if msg_list:
-            last = msg_list[-1]
-            msg_list[-1] = {**last, "content": (last.get("content") or "") + instruction}
-        else:
-            msg_list.append({"role": "user", "content": instruction})
-    kw = dict(model=model, messages=msg_list, response_format={"type": "json_object"})
-    if not is_gpt5 and temperature is not None:
-        kw["temperature"] = temperature
-    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
-    resp = await self.client.chat.completions.create(**kw)
-    content = resp.choices[0].message.content if resp.choices else "{}"
-    usage = resp.usage
-    class _R:
-        output_text = content
-        class _U:
-            input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
-            output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
-        _usage = _U()
-    _R.usage = _R._usage
-    return _R()
-
-_gc_oi.OpenAIClient._create_completion = _patched_create_completion
-_gc_oi.OpenAIClient._create_structured_completion = _patched_create_structured_completion
-
-llm_client = OpenAIClient(config=LLMConfig(
-    api_key=llm_key, model=llm_mdl, base_url=llm_url, small_model=llm_mdl,
-))
-
-embed_raw  = os.getenv("EMBEDDING_ENDPOINT", "http://host.docker.internal:11434/api/embeddings")
-if "/api/embeddings" in embed_raw:
-    embed_base = embed_raw.rsplit("/api/embeddings", 1)[0].rstrip("/") + "/v1"
-else:
-    embed_base = embed_raw.rstrip("/")
-embed_mdl  = __EMBED_MODEL__
-embed_key  = os.getenv("EMBEDDING_API_KEY") or ("ollama" if "11434" in embed_base else llm_key)
-
-embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
-    api_key=embed_key, base_url=embed_base, embedding_model=embed_mdl,
-))
-
-db_url  = os.getenv("GRAPH_DATABASE_URL",     "bolt://neo4j:7687")
-db_user = os.getenv("GRAPH_DATABASE_USERNAME", "neo4j")
-db_pass = os.getenv("GRAPH_DATABASE_PASSWORD", "neo4j_pass")
-
-async def run():
-    valid = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
-    if not valid:
-        raise RuntimeError("No non-empty texts provided")
-    g = Graphiti(db_url, db_user, db_pass, llm_client=llm_client, embedder=embedder)
-    await g.build_indices_and_constraints()
-    try:
-        for i, text in enumerate(valid):
-            await g.add_episode(
-                name="episode_" + str(i),
-                episode_body=text,
-                source=EpisodeType.text,
-                source_description="mcp_wrapper",
-                reference_time=datetime.now(),
-                group_id="default",
-            )
-            print("Added: " + text[:80])
-    finally:
-        await g.close()
-    print("Ingested " + str(len(valid)) + " episode(s) into Graphiti graph.")
-
-asyncio.run(run())
-"""
-        _embed_mdl = (os.getenv("GRAPHITI_EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL", "nomic-embed-text")).replace("openai/", "")
-        script = script_template.replace("__PAYLOAD__", repr(payload)).replace("__EMBED_MODEL__", repr(_embed_mdl))
-        buf = _io.BytesIO()
-        with _tar.open(fileobj=buf, mode="w") as t:
-            content = script.encode()
-            info = _tar.TarInfo(name="run_graphiti_ingest.py")
-            info.size = len(content)
-            t.addfile(info, _io.BytesIO(content))
-        buf.seek(0)
-        container.put_archive("/tmp", buf.read())
-
-        exit_code, output = container.exec_run(
-            "python3 /tmp/run_graphiti_ingest.py", stream=False
-        )
-        text = output.decode(errors="replace") if output else ""
-        if exit_code != 0:
-            return f"Graphiti ingest error (exit {exit_code}): {text[-400:]}"
-        return text.strip() or f"Ingested {len(texts)} episodes."
-
-    return await loop.run_in_executor(None, _exec)
+    return f"Dataset '{clean}' noted — no bound session to update."
 
 
-async def run_graphiti_search(query: str) -> str:
-    """Search the Graphiti episode graph for fact evolution."""
+async def run_switch_dataset(dataset_name: str, session_id: str) -> str:
+    """Switch the active dataset for the current session."""
+    clean = dataset_name.strip()
+    if not clean:
+        return "Error: dataset_name cannot be empty."
+    if session_id and session_id in _sessions:
+        old = _sessions[session_id].get("dataset_name", "main_dataset")
+        _sessions[session_id]["dataset_name"] = clean
+        log.info("dataset switched", extra={"session_id": session_id, "from": old, "to": clean, "tool": "switch_dataset"})
+        return f"Switched active dataset from '{old}' → '{clean}' for this session."
+    return f"Active dataset set to '{clean}' (no bound session)."
+
+
+async def run_delete_dataset(dataset_name: str) -> str:
+    """Delete a Cognee dataset via docker exec using the internal datasets module."""
     loop = asyncio.get_event_loop()
 
     def _exec() -> str:
@@ -878,157 +985,111 @@ async def run_graphiti_search(query: str) -> str:
         client = _docker.from_env()
         container = client.containers.get(COGNEE_CONTAINER_NAME)
 
-        # Plain string (not f-string) -- avoids triple-quote termination bug.
-        # __QUERY__ is replaced with the repr'd query string at runtime.
         script_template = """
-import asyncio, os
-from graphiti_core import Graphiti
-from graphiti_core.llm_client.openai_client import OpenAIClient, LLMConfig
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-
-import sys
+import asyncio, sys
 sys.path.insert(0, '/app/src')
-from cognee.tasks.temporal_awareness import search_graph_with_temporal_awareness
 
-query = __QUERY__
+dataset_name = __DATASET__
 
-llm_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-llm_url = os.getenv("LLM_ENDPOINT", "").rstrip("/") or None
-llm_mdl = os.getenv("LLM_MODEL", "gpt-4o-mini").replace("openai/", "")
-if not llm_key:
-    raise RuntimeError("LLM_API_KEY and OPENAI_API_KEY are both unset")
-
-# Monkey-patch: Azure does not support the Responses API (responses.parse).
-# _create_completion and _create_structured_completion are defined on OpenAIClient
-# (not BaseOpenAIClient), so we patch OpenAIClient directly.
-import graphiti_core.llm_client.openai_client as _gc_oi
-
-async def _patched_create_completion(self, model, messages, temperature, max_tokens,
-                                     response_model=None, reasoning=None, verbosity=None):
-    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
-    kw = dict(model=model, messages=messages, response_format={"type": "json_object"})
-    if not is_gpt5 and temperature is not None:
-        kw["temperature"] = temperature
-    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
-    return await self.client.chat.completions.create(**kw)
-
-async def _patched_create_structured_completion(self, model, messages, temperature, max_tokens,
-                                                 response_model=None, reasoning=None, verbosity=None):
-    import json as _json
-    is_gpt5 = model.startswith("gpt-5") or model.startswith("o1") or model.startswith("o3")
-    msg_list = list(messages)
-    if response_model is not None:
-        schema = response_model.model_json_schema()
-        schema_str = _json.dumps(schema, indent=2)
-        instruction = (
-            "\\n\\nIMPORTANT: Respond with a JSON object that EXACTLY matches this schema. "
-            "Use only the field names listed in the schema:\\n" + schema_str
-        )
-        if msg_list:
-            last = msg_list[-1]
-            msg_list[-1] = {**last, "content": (last.get("content") or "") + instruction}
-        else:
-            msg_list.append({"role": "user", "content": instruction})
-    kw = dict(model=model, messages=msg_list, response_format={"type": "json_object"})
-    if not is_gpt5 and temperature is not None:
-        kw["temperature"] = temperature
-    kw["max_completion_tokens" if is_gpt5 else "max_tokens"] = max_tokens
-    resp = await self.client.chat.completions.create(**kw)
-    content = resp.choices[0].message.content if resp.choices else "{}"
-    usage = resp.usage
-    class _R:
-        output_text = content
-        class _U:
-            input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
-            output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
-        _usage = _U()
-    _R.usage = _R._usage
-    return _R()
-
-_gc_oi.OpenAIClient._create_completion = _patched_create_completion
-_gc_oi.OpenAIClient._create_structured_completion = _patched_create_structured_completion
-
-llm_client = OpenAIClient(config=LLMConfig(
-    api_key=llm_key, model=llm_mdl, base_url=llm_url, small_model=llm_mdl,
-))
-
-embed_raw  = os.getenv("EMBEDDING_ENDPOINT", "http://host.docker.internal:11434/api/embeddings")
-if "/api/embeddings" in embed_raw:
-    embed_base = embed_raw.rsplit("/api/embeddings", 1)[0].rstrip("/") + "/v1"
-else:
-    embed_base = embed_raw.rstrip("/")
-embed_mdl  = __EMBED_MODEL__
-embed_key  = os.getenv("EMBEDDING_API_KEY") or ("ollama" if "11434" in embed_base else llm_key)
-
-embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(
-    api_key=embed_key, base_url=embed_base, embedding_model=embed_mdl,
-))
-
-db_url  = os.getenv("GRAPH_DATABASE_URL",     "bolt://neo4j:7687")
-db_user = os.getenv("GRAPH_DATABASE_USERNAME", "neo4j")
-db_pass = os.getenv("GRAPH_DATABASE_PASSWORD", "neo4j_pass")
-
-async def run():
-    g = Graphiti(db_url, db_user, db_pass, llm_client=llm_client, embedder=embedder)
-    await g.build_indices_and_constraints()
+async def main():
+    # Attempt 1: internal datasets module (preferred)
     try:
-        results = await search_graph_with_temporal_awareness(g, query)
-        if not results:
-            print("No results found.")
-        for item in results:
-            print(item)
-    finally:
-        await g.close()
+        from cognee.modules.datasets.methods import get_datasets
+        from cognee.modules.datasets.methods.delete_dataset import delete_dataset
+        all_ds = await get_datasets()
+        targets = [d for d in all_ds if getattr(d, 'name', '') == dataset_name]
+        if targets:
+            for ds in targets:
+                await delete_dataset(ds.id)
+            print(f"Deleted dataset '{dataset_name}' ({len(targets)} entr(ies)).")
+        else:
+            print(f"Dataset '{dataset_name}' not found in registry.")
+        return
+    except Exception as e1:
+        pass
 
-asyncio.run(run())
+    # Attempt 2: cognee high-level API
+    try:
+        import cognee
+        await cognee.delete_data(dataset_name=dataset_name)
+        print(f"Deleted dataset '{dataset_name}' via cognee.delete_data.")
+        return
+    except Exception as e2:
+        pass
+
+    print(f"Could not delete dataset '{dataset_name}': no compatible API found in this Cognee build.")
+
+asyncio.run(main())
 """
-        _embed_mdl = (os.getenv("GRAPHITI_EMBEDDING_MODEL") or os.getenv("EMBEDDING_MODEL", "nomic-embed-text")).replace("openai/", "")
-        script = script_template.replace("__QUERY__", repr(query)).replace("__EMBED_MODEL__", repr(_embed_mdl))
-
-
-
+        script = script_template.replace("__DATASET__", repr(dataset_name))
         buf = _io.BytesIO()
         with _tar.open(fileobj=buf, mode="w") as t:
             content = script.encode()
-            info = _tar.TarInfo(name="run_graphiti_search.py")
+            info = _tar.TarInfo(name="run_delete_dataset.py")
             info.size = len(content)
             t.addfile(info, _io.BytesIO(content))
         buf.seek(0)
         container.put_archive("/tmp", buf.read())
 
-        exit_code, output = container.exec_run(
-            "python3 /tmp/run_graphiti_search.py", stream=False
-        )
+        exit_code, output = container.exec_run("python3 /tmp/run_delete_dataset.py", stream=False)
         text = output.decode(errors="replace") if output else ""
         if exit_code != 0:
-            return f"Graphiti search error (exit {exit_code}): {text[-400:]}"
-        return text.strip() or "No results found."
+            return f"Delete error (exit {exit_code}): {text[-400:]}"
+        return text.strip() or f"Dataset '{dataset_name}' deletion attempted."
 
     return await loop.run_in_executor(None, _exec)
 
 
 # ── tool dispatcher ────────────────────────────────────────────────────────────
 
-async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGENT_USER) -> str:
+async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGENT_USER, dataset: str = "main_dataset") -> str:
     t0 = time.monotonic()
+    # Keep last_active fresh on every tool call
+    if session_id and session_id in _sessions:
+        _sessions[session_id]["last_active"] = time.time()
 
     try:
         if tool == "cognify":
-            cognify_args: dict = {"data": args["data"], "temporal_cognify": True}
+            cognify_args: dict = {
+                "data": args["data"],
+                "temporal_cognify": args.get("temporal", False),
+            }
+            if dataset != "main_dataset":
+                cognify_args["dataset_name"] = dataset
             result = await cognee_call("cognify", cognify_args, timeout=300)
         elif tool == "save_interaction":
             # Cognee's save_interaction has a bug: it creates a TextDocument with a file
             # path but never writes the file before the pipeline reads it. Routing to
             # cognify uses the working code path with the same interface.
-            result = await cognee_call("cognify", {"data": args["data"]}, timeout=300)
+            save_args: dict = {"data": args["data"]}
+            if dataset != "main_dataset":
+                save_args["dataset_name"] = dataset
+            result = await cognee_call("cognify", save_args, timeout=300)
         elif tool == "search":
             query = args.get("search_query") or args.get("query", "")
             if not query:
                 return [{"type": "text", "text": "Error: search_query is required"}]
-            result = await cognee_call("search", {
+            search_args: dict = {
                 "search_query": query,
                 "search_type":  args.get("search_type", "GRAPH_COMPLETION"),
-            }, timeout=180)
+            }
+            if dataset != "main_dataset":
+                search_args["dataset_name"] = dataset
+            result = await cognee_call("search", search_args, timeout=180)
+        elif tool == "forget_memory":
+            forget_args: dict = {}
+            if args.get("dataset"):
+                forget_args["dataset"] = args["dataset"]
+            if args.get("everything"):
+                forget_args["everything"] = args["everything"]
+            result = await cognee_call("forget_memory", forget_args, timeout=60)
+        elif tool == "delete":
+            delete_args: dict = {"data_id": args["data_id"]}
+            if args.get("dataset_id"):
+                delete_args["dataset_id"] = args["dataset_id"]
+            if args.get("mode"):
+                delete_args["mode"] = args["mode"]
+            result = await cognee_call("delete", delete_args, timeout=60)
         elif tool == "list_data":
             result = await cognee_call("list_data", {}, timeout=60)
         elif tool == "cognify_status":
@@ -1036,7 +1097,34 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
         elif tool == "prune":
             result = await run_prune()
         elif tool == "memify":
-            result = await run_memify(args.get("dataset", "main_dataset"))
+            result = await run_memify(args.get("dataset", dataset))
+        elif tool == "improve":
+            improve_args: dict = {
+                "dataset_name": args.get("dataset_name", dataset),
+            }
+            # Use explicitly passed session_ids, or auto-inject the current session
+            session_ids = args.get("session_ids") or ([session_id] if session_id else None)
+            if session_ids:
+                improve_args["session_ids"] = session_ids
+            result = await cognee_call("improve", improve_args, timeout=600)
+        elif tool == "submit_feedback":
+            result = await run_submit_feedback(
+                user_id=args.get("user_id", user),
+                session_id=args.get("session_id", session_id),
+                qa_id=args.get("qa_id", ""),
+                feedback_score=args.get("feedback_score"),
+                feedback_text=args.get("feedback_text"),
+            )
+        elif tool == "record_trace":
+            result = await run_record_trace(
+                user_id=args.get("user_id", user),
+                session_id=args.get("session_id", session_id),
+                origin_function=args.get("origin_function", "unknown"),
+                status=args.get("status", "success"),
+                memory_query=args.get("memory_query", ""),
+                method_params=args.get("method_params") or {},
+                error_message=args.get("error_message", ""),
+            )
         elif tool == "persist_sessions":
             result = await run_persist_sessions(args.get("data", ""), user=user)
         elif tool == "improve_answer":
@@ -1044,18 +1132,16 @@ async def dispatch(tool: str, args: dict, session_id: str = "", user: str = AGEN
                 args.get("question", ""), args.get("wrong_answer", ""), args.get("feedback", ""),
                 user=user,
             )
-        elif tool == "graphiti_ingest":
-            texts = args.get("texts", [])
-            if not texts:
-                result = "Error: texts list is required and cannot be empty."
+        elif tool == "create_dataset":
+            result = await run_create_dataset(args.get("dataset_name", ""), session_id=session_id)
+        elif tool == "switch_dataset":
+            result = await run_switch_dataset(args.get("dataset_name", ""), session_id=session_id)
+        elif tool == "delete_dataset":
+            ds = args.get("dataset_name", "")
+            if not ds:
+                result = "Error: dataset_name is required."
             else:
-                result = await run_graphiti_ingest(texts)
-        elif tool == "graphiti_search":
-            query = args.get("query", "")
-            if not query:
-                result = "Error: query is required."
-            else:
-                result = await run_graphiti_search(query)
+                result = await run_delete_dataset(ds)
         else:
             result = f"Unknown tool: {tool}"
 
@@ -1114,6 +1200,8 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Cognee MCP Wrapper", lifespan=_lifespan)
 
+
+
 # Active sessions: session_id → {"agent_id": str, "created_at": float}
 _sessions: dict[str, dict] = {}
 
@@ -1157,6 +1245,13 @@ def _session_user(sid: str) -> str:
     return AGENT_USER
 
 
+def _session_dataset(sid: str) -> str:
+    """Return the active dataset_name bound to this session, defaulting to 'main_dataset'."""
+    if sid and sid in _sessions:
+        return _sessions[sid].get("dataset_name", "main_dataset")
+    return "main_dataset"
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     body = await request.json()
@@ -1167,8 +1262,15 @@ async def mcp_endpoint(request: Request):
     # ── initialize ──
     if method == "initialize":
         session_id = str(uuid.uuid4())
-        agent_name = body.get("params", {}).get("clientInfo", {}).get("name", "unknown")
-        _sessions[session_id] = {"agent_id": agent_name, "created_at": time.time()}
+        params = body.get("params", {})
+        agent_name = params.get("clientInfo", {}).get("name", "unknown")
+        dataset_name = params.get("dataset_name", "main_dataset")
+        _sessions[session_id] = {
+            "agent_id": agent_name,
+            "created_at": time.time(),
+            "last_active": time.time(),
+            "dataset_name": dataset_name,
+        }
         log.info("session init", extra={"session_id": session_id, "tool": f"agent={agent_name}"})
         payload = {
             "jsonrpc": "2.0", "id": req_id,
@@ -1204,6 +1306,7 @@ async def mcp_endpoint(request: Request):
         tool_name = body["params"]["name"]
         tool_args = body["params"].get("arguments", {})
         agent_user = _session_user(sid)
+        active_dataset = _session_dataset(sid)
 
         if MCP_WRAPPER_STREAMING:
             # Stream SSE events incrementally — no buffering
@@ -1214,7 +1317,7 @@ async def mcp_endpoint(request: Request):
 
         # Non-streaming (default) — buffer full result, emit single SSE event
         try:
-            result_text = await dispatch(tool_name, tool_args, session_id=sid, user=agent_user)
+            result_text = await dispatch(tool_name, tool_args, session_id=sid, user=agent_user, dataset=active_dataset)
         except Exception as exc:
             result_text = f"Error: {exc}"
         payload = {
@@ -1237,13 +1340,21 @@ _start_time = time.time()
 _TOOL_METADATA: dict[str, dict] = {
     "cognify":           {"category": "write", "typical_latency_seconds": 30},
     "save_interaction":  {"category": "write", "typical_latency_seconds": 2},
+    "forget_memory":     {"category": "admin", "typical_latency_seconds": 3},
+    "delete":            {"category": "admin", "typical_latency_seconds": 2},
     "search":            {"category": "read",  "typical_latency_seconds": 5},
     "list_data":         {"category": "read",  "typical_latency_seconds": 2},
     "cognify_status":    {"category": "read",  "typical_latency_seconds": 1},
     "prune":             {"category": "admin", "typical_latency_seconds": 5},
     "memify":            {"category": "write", "typical_latency_seconds": 120},
+    "submit_feedback":   {"category": "write", "typical_latency_seconds": 3},
+    "record_trace":      {"category": "write", "typical_latency_seconds": 3},
+    "improve":           {"category": "write", "typical_latency_seconds": 300},
     "persist_sessions":  {"category": "write", "typical_latency_seconds": 10},
     "improve_answer":    {"category": "write", "typical_latency_seconds": 10},
+    "create_dataset":    {"category": "admin", "typical_latency_seconds": 1},
+    "switch_dataset":    {"category": "admin", "typical_latency_seconds": 1},
+    "delete_dataset":    {"category": "admin", "typical_latency_seconds": 5},
 }
 
 
@@ -1258,7 +1369,7 @@ async def list_tools_doc():
             "name": "cognee-mcp-wrapper",
             "version": "1.0.0",
             "mcp_endpoint": "/mcp",
-            "auth": "none" if not MCP_WRAPPER_API_KEY else "x-api-key header",
+            "auth": "none",
         },
         "session_handshake": {
             "step_1": "POST /mcp  method=initialize  →  mcp-session-id header returned",
@@ -1282,6 +1393,86 @@ async def health():
         "circuit_breaker_open": cb_open,
         "consecutive_failures": proxy._failures,
     }
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """List all active MCP sessions with metadata."""
+    now = time.time()
+    return {
+        "active_sessions": len(_sessions),
+        "sessions": [
+            {
+                "session_id": sid,
+                "agent_id": s["agent_id"],
+                "dataset_name": s.get("dataset_name", "main_dataset"),
+                "created_at": s["created_at"],
+                "last_active": s.get("last_active", s["created_at"]),
+                "age_seconds": round(now - s["created_at"]),
+                "idle_seconds": round(now - s.get("last_active", s["created_at"])),
+                "ttl_remaining_seconds": max(0, round(SESSION_TTL_SECONDS - (now - s["created_at"]))),
+            }
+            for sid, s in _sessions.items()
+        ],
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get metadata for a specific MCP session."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    s = _sessions[session_id]
+    now = time.time()
+    return {
+        "session_id": session_id,
+        "agent_id": s["agent_id"],
+        "dataset_name": s.get("dataset_name", "main_dataset"),
+        "created_at": s["created_at"],
+        "last_active": s.get("last_active", s["created_at"]),
+        "age_seconds": round(now - s["created_at"]),
+        "idle_seconds": round(now - s.get("last_active", s["created_at"])),
+        "ttl_remaining_seconds": max(0, round(SESSION_TTL_SECONDS - (now - s["created_at"]))),
+    }
+
+
+@app.delete("/sessions/{session_id}")
+async def terminate_session(session_id: str):
+    """Forcibly terminate an MCP session before its TTL expires."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    s = _sessions.pop(session_id)
+    log.info("session terminated by admin", extra={"session_id": session_id, "tool": "admin"})
+    return {"terminated": True, "session_id": session_id, "agent_id": s["agent_id"]}
+
+
+# ── admin: ontology reload ─────────────────────────────────────────────────────
+
+@app.post("/admin/reload-cognee")
+async def reload_cognee_container():
+    """Restart cognee-mcp so it picks up a newly uploaded ontology file.
+
+    Protected by the same API key middleware as all other endpoints.
+    The web service calls this after writing a new .ttl/.owl file to the
+    shared ontologies volume.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _restart() -> str:
+        import docker as _docker
+        client = _docker.from_env()
+        container = client.containers.get(COGNEE_CONTAINER_NAME)
+        container.restart(timeout=30)
+        return "restarting"
+
+    try:
+        status = await loop.run_in_executor(None, _restart)
+        log.info("cognee-mcp container restarted for ontology reload", extra={"tool": "admin"})
+        return {"status": status, "container": COGNEE_CONTAINER_NAME,
+                "message": "cognee-mcp is restarting — allow ~60s for health check to pass again"}
+    except Exception as exc:
+        log.error("Failed to restart cognee-mcp: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Restart failed: {exc}")
 
 
 # ── run ────────────────────────────────────────────────────────────────────────

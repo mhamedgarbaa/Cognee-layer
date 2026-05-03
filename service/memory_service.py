@@ -7,6 +7,8 @@ from service.business_models import (
     DeleteResult,
     PruneResult,
     CognifyStatus,
+    FeedbackResult,
+    TraceResult,
 )
 from configuration.logging_setup import logger
 import asyncio
@@ -139,6 +141,18 @@ class MemoryService:
             logger.error(f"Cognee tool error during delete: {e}")
             raise MemoryServiceUnavailable("Failed to delete data.")
 
+    async def delete_dataset(self, dataset_id: str, mode: str = "soft") -> DeleteResult:
+        """Delete all data items in a specific dataset."""
+        try:
+            result = await self.repo.delete_dataset(dataset_id=dataset_id, mode=mode)
+            return DeleteResult(status="deleted", details=result)
+        except CogneeConnectionError as e:
+            logger.error(f"Failed to delete dataset: {e}")
+            raise MemoryServiceUnavailable("Memory subsystem is unreachable.")
+        except CogneeToolError as e:
+            logger.error(f"Cognee tool error during delete_dataset: {e}")
+            raise MemoryServiceUnavailable("Failed to delete dataset.")
+
     async def prune_all_memory(self) -> PruneResult:
         """Permanently wipe ALL data from the Cognee knowledge graph."""
         try:
@@ -151,6 +165,71 @@ class MemoryService:
         except CogneeToolError as e:
             logger.error(f"Cognee tool error during prune: {e}")
             raise MemoryServiceUnavailable("Failed to prune memory data.")
+
+    # ──────────────────────────────────────────────
+    # Feedback & Trace Operations
+    # ──────────────────────────────────────────────
+
+    async def submit_feedback(
+        self,
+        user_id: str,
+        session_id: str,
+        qa_id: str,
+        feedback_score: int,
+        feedback_text: str | None = None,
+    ) -> FeedbackResult:
+        """Submit quality feedback for a previous recall result."""
+        try:
+            result = await self.repo.submit_feedback(
+                user_id=user_id,
+                session_id=session_id,
+                qa_id=qa_id,
+                feedback_score=feedback_score,
+                feedback_text=feedback_text,
+            )
+            return FeedbackResult(
+                status=result.get("status", "accepted"),
+                qa_id=result.get("qa_id", qa_id),
+                feedback_score=feedback_score,
+            )
+        except CogneeConnectionError as e:
+            logger.error(f"Failed to submit feedback: {e}")
+            raise MemoryServiceUnavailable("Memory subsystem is unreachable.")
+        except CogneeToolError as e:
+            logger.error(f"Cognee tool error during submit_feedback: {e}")
+            raise MemoryServiceUnavailable("Failed to submit feedback.")
+
+    async def record_trace(
+        self,
+        user_id: str,
+        session_id: str,
+        origin_function: str,
+        status: str = "success",
+        memory_query: str = "",
+        method_params: dict | None = None,
+        error_message: str = "",
+    ) -> TraceResult:
+        """Record an agent trace step for observability."""
+        try:
+            result = await self.repo.record_trace(
+                user_id=user_id,
+                session_id=session_id,
+                origin_function=origin_function,
+                status=status,
+                memory_query=memory_query,
+                method_params=method_params,
+                error_message=error_message,
+            )
+            return TraceResult(
+                status=result.get("status", "recorded"),
+                trace_id=result.get("trace_id"),
+            )
+        except CogneeConnectionError as e:
+            logger.error(f"Failed to record trace: {e}")
+            raise MemoryServiceUnavailable("Memory subsystem is unreachable.")
+        except CogneeToolError as e:
+            logger.error(f"Cognee tool error during record_trace: {e}")
+            raise MemoryServiceUnavailable("Failed to record trace.")
 
     async def get_cognify_status(self) -> CognifyStatus:
         """Check the status of the cognify pipeline."""
