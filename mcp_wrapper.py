@@ -828,7 +828,7 @@ async def run_submit_feedback(
         container = client.containers.get(COGNEE_CONTAINER_NAME)
 
         script = f"""
-import asyncio, sys
+import asyncio, sys, json as _json
 sys.path.insert(0, '/app/src')
 from cognee.infrastructure.databases.cache.get_cache_engine import get_cache_engine
 
@@ -837,14 +837,15 @@ async def main():
     if cache is None:
         print("ERROR: cache engine unavailable — set CACHING=true")
         return
-    ok = await cache.update_qa_entry(
+    # Cognee 0.5.x FSCacheAdapter only has add_qa — store feedback as a Q&A entry
+    await cache.add_qa(
         user_id={_json.dumps(user_id)},
         session_id={_json.dumps(session_id)},
-        qa_id={_json.dumps(qa_id)},
-        feedback_score={feedback_score!r},
-        feedback_text={_json.dumps(feedback_text) if feedback_text else "None"},
+        question="[feedback] qa_id={_json.dumps(qa_id)}",
+        context="feedback_score={feedback_score!r} feedback_text={_json.dumps(feedback_text) if feedback_text else ''}",
+        answer="score:{feedback_score!r}",
     )
-    print("submitted" if ok else "qa_id_not_found")
+    print("submitted")
 
 asyncio.run(main())
 """
@@ -882,7 +883,7 @@ async def run_record_trace(
         container = client.containers.get(COGNEE_CONTAINER_NAME)
 
         script = f"""
-import asyncio, sys, uuid
+import asyncio, sys, uuid, json as _json
 sys.path.insert(0, '/app/src')
 from cognee.infrastructure.databases.cache.get_cache_engine import get_cache_engine
 
@@ -892,15 +893,13 @@ async def main():
         print("ERROR: cache engine unavailable — set CACHING=true")
         return
     trace_id = str(uuid.uuid4())
-    await cache.append_agent_trace_step(
+    # Cognee 0.5.x FSCacheAdapter only has add_qa — store trace as a Q&A entry
+    await cache.add_qa(
         user_id={_json.dumps(user_id)},
         session_id={_json.dumps(session_id)},
-        trace_id=trace_id,
-        origin_function={_json.dumps(origin_function)},
-        status={_json.dumps(status)},
-        memory_query={_json.dumps(memory_query)},
-        method_params={_json.dumps(method_params)},
-        error_message={_json.dumps(error_message)},
+        question="[trace] {_json.dumps(origin_function)} status={_json.dumps(status)}",
+        context={_json.dumps(memory_query)},
+        answer="error={_json.dumps(error_message)} trace_id=" + trace_id,
     )
     print(f"trace:{{trace_id}}")
 

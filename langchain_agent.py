@@ -71,6 +71,7 @@ Today: {datetime.now().strftime("%Y-%m-%d")}  |  User: {USER_ID}
 | List stored datasets | `list_data` | — |
 | Delete wrong info | `forget_memory` | — |
 | Rate a previous answer | `submit_feedback` | — |
+| Correct a specific wrong answer | `improve_answer` | — |
 """
 
 
